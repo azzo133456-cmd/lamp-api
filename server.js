@@ -1,9 +1,12 @@
 import express from "express";
 import cors from "cors";
-import lamps from "./lamps.json" assert { type: "json" };
+import fs from "fs";
 
 const app = express();
 app.use(cors());
+
+// 讀取 JSON 檔案
+const lamps = JSON.parse(fs.readFileSync("./lamps.json", "utf8"));
 
 app.get("/lamp/:id", (req, res) => {
   const id = req.params.id;
@@ -20,4 +23,7 @@ app.get("/lamp/:id", (req, res) => {
   });
 });
 
-app.listen(3000, () => console.log("API running on port 3000"));
+// Render 會提供 PORT，不能寫死 3000
+app.listen(process.env.PORT || 3000, () =>
+  console.log("API running")
+);
