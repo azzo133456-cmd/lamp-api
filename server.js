@@ -26,12 +26,13 @@ app.get("/lamp/:id", (req, res) => {
   }
 
   res.json({
-    id: lamp.id,
-    address: lamp.address,
-    lat: lamp.lat,
-    lng: lamp.lng,
-    nav: `https://www.google.com/maps/dir/?api=1&destination=${lamp.lat},${lamp.lng}`
-  });
+  id: lamp.id,
+  address: lamp.address,
+  lat: lamp.lng,   // ← 緯度（24.xxx）
+  lng: lamp.lat,   // ← 經度（121.xxx）
+  nav: `https://www.google.com/maps/dir/?api=1&destination=${lamp.lng},${lamp.lat}`
+});
+
 });
 
 // Render 需要的 port
