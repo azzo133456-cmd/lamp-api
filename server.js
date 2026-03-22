@@ -1,18 +1,48 @@
 import express from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
+import fs from "fs";
+import https from "https";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ------------------------------------------------------
+// 🔥 GitHub RAW lamps.db（Railway 啟動時自動下載）
+// ------------------------------------------------------
+const DB_URL = "https://raw.githubusercontent.com/azzo133456-cmd/lamp-api/main/data/lamps.db";
+const LOCAL_DB = path.join(__dirname, "lamps.db");
+
+// 下載資料庫
+function downloadDB() {
+  return new Promise((resolve) => {
+    console.log("Downloading lamps.db from GitHub...");
+    const file = fs.createWriteStream(LOCAL_DB);
+    https.get(DB_URL, (res) => {
+      res.pipe(file);
+      file.on("finish", () => {
+        file.close(() => {
+          console.log("lamps.db downloaded.");
+          resolve();
+        });
+      });
+    });
+  });
+}
+
+// 🚀 啟動伺服器前下載資料庫
+await downloadDB();
+
+// ------------------------------------------------------
 // 建立 express app
+// ------------------------------------------------------
 const app = express();
 app.use(cors());
 
 // 正確定位 lamps.db
-const db = new Database(path.join(__dirname, "lamps.db"));
+const db = new Database(LOCAL_DB);
 
 // ------------------------------------------------------
 // 取得單一路燈
@@ -30,14 +60,14 @@ app.get("/lamp/:id", (req, res) => {
   res.json({
     id: lamp.id,
     address: lamp.address,
-    lat: lamp.lat,   // 你確認不需要交換 → 保持原樣
+    lat: lamp.lat,
     lng: lamp.lng,
     nav: `https://www.google.com/maps/dir/?api=1&destination=${lamp.lat},${lamp.lng}`
   });
 });
 
 // ------------------------------------------------------
-// 🔥 最近路燈 API（不交換經緯度）
+// 🔥 最近路燈 API（依照你的資料庫格式）
 // ------------------------------------------------------
 
 // 計算距離（Haversine）
@@ -92,7 +122,7 @@ app.get("/nearest", (req, res) => {
 });
 
 // ------------------------------------------------------
-// Render 需要的 port
+// 啟動伺服器
 // ------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
