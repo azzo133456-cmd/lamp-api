@@ -104,8 +104,8 @@ app.get("/nearest", (req, res) => {
     // ⚠ 依照你的資料庫格式：
     // lamp.lat = 經度
     // lamp.lng = 緯度
-    const lampLat = Number(lamp.lng); // 緯度
-    const lampLng = Number(lamp.lat); // 經度
+    const lampLat = Number(lamp.lat); // 緯度
+    const lampLng = Number(lamp.lng); // 經度
 
     const d = distance(userLat, userLng, lampLat, lampLng);
 
