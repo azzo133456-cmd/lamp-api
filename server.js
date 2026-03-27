@@ -62,6 +62,8 @@ app.get("/lamp/:id", (req, res) => {
     address: lamp.address,
     lat: lamp.lat,
     lng: lamp.lng,
+    watt: lamp.watt,
+    col: lamp.col,
     nav: `https://www.google.com/maps/dir/?api=1&destination=${lamp.lat},${lamp.lng}`
   });
 });
