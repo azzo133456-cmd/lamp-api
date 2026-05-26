@@ -52,12 +52,27 @@ const db = new Database(LOCAL_DB);
 // tasks 資料表（任務清單，多人共用）
 db.prepare(`
   CREATE TABLE IF NOT EXISTS tasks (
-    area    TEXT NOT NULL,
-    lamp_id TEXT NOT NULL,
-    added_at TEXT DEFAULT (datetime('now','localtime')),
-    PRIMARY KEY (area, lamp_id)
+    area      TEXT NOT NULL,
+    task_id   TEXT NOT NULL,
+    is_custom INTEGER DEFAULT 0,
+    label     TEXT,
+    lat       TEXT,
+    lng       TEXT,
+    added_at  TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (area, task_id)
   )
 `).run();
+
+// migration：舊版 tasks 資料表補欄位
+const taskCols = db.prepare("PRAGMA table_info(tasks)").all().map(c => c.name);
+if (!taskCols.includes("is_custom")) db.prepare("ALTER TABLE tasks ADD COLUMN is_custom INTEGER DEFAULT 0").run();
+if (!taskCols.includes("label"))     db.prepare("ALTER TABLE tasks ADD COLUMN label TEXT").run();
+if (!taskCols.includes("lat"))       db.prepare("ALTER TABLE tasks ADD COLUMN lat TEXT").run();
+if (!taskCols.includes("lng"))       db.prepare("ALTER TABLE tasks ADD COLUMN lng TEXT").run();
+// 舊欄位 lamp_id 改名為 task_id（透過 RENAME 處理）
+if (taskCols.includes("lamp_id") && !taskCols.includes("task_id")) {
+  db.prepare("ALTER TABLE tasks RENAME COLUMN lamp_id TO task_id").run();
+}
 
 // ------------------------------------------------------
 // 取得單一路燈
@@ -142,32 +157,58 @@ app.get("/nearest", (req, res) => {
 // 📋 任務清單 API
 // ------------------------------------------------------
 
-// 取得某區任務清單（含路燈資料）
+// 取得某區任務清單
 app.get("/tasks/:area", (req, res) => {
-  const tasks = db.prepare(`
-    SELECT t.lamp_id AS id, t.added_at,
-           l.address, l.lat, l.lng, l.watt, l.col
+  const rows = db.prepare(`
+    SELECT t.task_id AS id, t.is_custom, t.label, t.added_at,
+           COALESCE(t.lat, l.lat) AS lat,
+           COALESCE(t.lng, l.lng) AS lng,
+           COALESCE(t.label, l.address) AS address,
+           l.watt, l.col
     FROM tasks t
-    LEFT JOIN lamps l ON l.id = t.lamp_id
+    LEFT JOIN lamps l ON l.id = t.task_id AND t.is_custom = 0
     WHERE t.area = ?
     ORDER BY t.added_at DESC
   `).all(req.params.area);
-  res.json(tasks);
+  res.json(rows);
 });
 
-// 新增路燈到任務清單
+// 新增路燈（支援單筆 { id } 或批次 { ids: [...] }）
 app.post("/tasks/:area", (req, res) => {
-  const { id } = req.body;
-  if (!id) return res.status(400).json({ error: "缺少 id" });
-  const lamp = db.prepare("SELECT id FROM lamps WHERE id = ?").get(id);
-  if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
-  db.prepare("INSERT OR IGNORE INTO tasks (area, lamp_id) VALUES (?, ?)").run(req.params.area, id);
-  res.json({ ok: true });
+  const { id, ids } = req.body;
+  const list = ids ?? (id ? [id] : []);
+  if (!list.length) return res.status(400).json({ error: "缺少 id 或 ids" });
+
+  const insert = db.prepare("INSERT OR IGNORE INTO tasks (area, task_id) VALUES (?, ?)");
+  const results = { ok: 0, notFound: [] };
+
+  const run = db.transaction(() => {
+    for (const lampId of list) {
+      const lamp = db.prepare("SELECT id FROM lamps WHERE id = ?").get(lampId.trim());
+      if (!lamp) { results.notFound.push(lampId); continue; }
+      insert.run(req.params.area, lampId.trim());
+      results.ok++;
+    }
+  });
+  run();
+  res.json({ ok: true, added: results.ok, notFound: results.notFound });
+});
+
+// 新增自訂地點（無路燈編號）
+app.post("/tasks/:area/custom", (req, res) => {
+  const { label, lat, lng } = req.body;
+  if (!lat || !lng) return res.status(400).json({ error: "缺少經緯度" });
+  const task_id = `custom_${Date.now()}`;
+  db.prepare(`
+    INSERT INTO tasks (area, task_id, is_custom, label, lat, lng)
+    VALUES (?, ?, 1, ?, ?, ?)
+  `).run(req.params.area, task_id, label || null, String(lat), String(lng));
+  res.json({ ok: true, task_id });
 });
 
 // 從任務清單移除
 app.delete("/tasks/:area/:id", (req, res) => {
-  db.prepare("DELETE FROM tasks WHERE area = ? AND lamp_id = ?")
+  db.prepare("DELETE FROM tasks WHERE area = ? AND task_id = ?")
     .run(req.params.area, decodeURIComponent(req.params.id));
   res.json({ ok: true });
 });
