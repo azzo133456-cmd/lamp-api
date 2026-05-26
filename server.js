@@ -251,21 +251,24 @@ app.post("/import", (req, res) => {
   }
 
   try {
-    const upsert = db.prepare(`
-      INSERT OR REPLACE INTO lamps (id, address, lat, lng, watt, col)
+    const del    = db.prepare("DELETE FROM lamps WHERE id = @id");
+    const insert = db.prepare(`
+      INSERT INTO lamps (id, address, lat, lng, watt, col)
       VALUES (@id, @address, @lat, @lng, @watt, @col)
     `);
 
     const importAll = db.transaction((rows) => {
       for (const r of rows) {
-        upsert.run({
+        const row = {
           id:      r.id      ?? null,
           address: r.address ?? null,
           lat:     r.lat     ?? null,
           lng:     r.lng     ?? null,
           watt:    r.watt    ?? null,
           col:     r.col     ?? null,
-        });
+        };
+        del.run({ id: row.id });
+        insert.run(row);
       }
     });
 
