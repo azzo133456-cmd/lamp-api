@@ -194,15 +194,41 @@ app.post("/tasks/:area", (req, res) => {
   res.json({ ok: true, added: results.ok, notFound: results.notFound });
 });
 
-// 新增自訂地點（無路燈編號）
-app.post("/tasks/:area/custom", (req, res) => {
-  const { label, lat, lng } = req.body;
-  if (!lat || !lng) return res.status(400).json({ error: "缺少經緯度" });
+// 地址定位（Nominatim / OpenStreetMap）
+function geocode(address) {
+  return new Promise((resolve) => {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&countrycodes=tw`;
+    https.get(url, { headers: { "User-Agent": "lamp-api/1.0" } }, (r) => {
+      let data = "";
+      r.on("data", c => data += c);
+      r.on("end", () => {
+        try {
+          const results = JSON.parse(data);
+          resolve(results[0] ? { lat: results[0].lat, lng: results[0].lon } : null);
+        } catch { resolve(null); }
+      });
+    }).on("error", () => resolve(null));
+  });
+}
+
+// 新增自訂地點（無路燈編號）；lat/lng 可省略，自動用地址定位
+app.post("/tasks/:area/custom", async (req, res) => {
+  let { label, lat, lng } = req.body;
+  if (!label) return res.status(400).json({ error: "請輸入名稱或地址" });
+
+  // 沒有經緯度 → 用地址定位
+  if (!lat || !lng) {
+    const coords = await geocode(label);
+    if (!coords) return res.status(400).json({ error: "地址定位失敗，請手動輸入經緯度" });
+    lat = coords.lat;
+    lng = coords.lng;
+  }
+
   const task_id = `custom_${Date.now()}`;
   db.prepare(`
     INSERT INTO tasks (area, task_id, is_custom, label, lat, lng)
     VALUES (?, ?, 1, ?, ?, ?)
-  `).run(req.params.area, task_id, label || null, String(lat), String(lng));
+  `).run(req.params.area, task_id, label, String(lat), String(lng));
   res.json({ ok: true, task_id });
 });
 
