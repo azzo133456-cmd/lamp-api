@@ -129,6 +129,26 @@ app.get("/nearest", (req, res) => {
 });
 
 // ------------------------------------------------------
+// ✏️ 單筆修改
+// ------------------------------------------------------
+app.patch("/lamp/:id", (req, res) => {
+  let id = decodeURIComponent(req.params.id.trim());
+  const lamp = db.prepare("SELECT * FROM lamps WHERE id = ?").get(id);
+  if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
+
+  const { address, watt, col } = req.body;
+  db.prepare(`UPDATE lamps SET address=@address, watt=@watt, col=@col WHERE id=@id`).run({
+    id,
+    address: address !== undefined ? address : lamp.address,
+    watt:    watt    !== undefined ? watt    : lamp.watt,
+    col:     col     !== undefined ? col     : lamp.col,
+  });
+
+  console.log(`[edit] ${id} updated`);
+  res.json({ ok: true });
+});
+
+// ------------------------------------------------------
 // 📥 匯入工具函式
 // ------------------------------------------------------
 
