@@ -180,10 +180,12 @@ app.patch("/lamp/:id", (req, res) => {
   const lamp = db.prepare("SELECT * FROM lamps WHERE id = ?").get(id);
   if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
 
-  const { address, watt, col } = req.body;
-  db.prepare(`UPDATE lamps SET address=@address, watt=@watt, col=@col WHERE id=@id`).run({
+  const { address, lat, lng, watt, col } = req.body;
+  db.prepare(`UPDATE lamps SET address=@address, lat=@lat, lng=@lng, watt=@watt, col=@col WHERE id=@id`).run({
     id,
     address: address !== undefined ? address : lamp.address,
+    lat:     lat     !== undefined ? lat     : lamp.lat,
+    lng:     lng     !== undefined ? lng     : lamp.lng,
     watt:    watt    !== undefined ? watt    : lamp.watt,
     col:     col     !== undefined ? col     : lamp.col,
   });
