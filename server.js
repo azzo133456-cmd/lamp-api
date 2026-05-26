@@ -194,17 +194,23 @@ app.post("/tasks/:area", (req, res) => {
   res.json({ ok: true, added: results.ok, notFound: results.notFound });
 });
 
-// 地址定位（Nominatim / OpenStreetMap）
+// 地址定位（Google Maps Geocoding API）
 function geocode(address) {
   return new Promise((resolve) => {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&countrycodes=tw`;
-    https.get(url, { headers: { "User-Agent": "lamp-api/1.0" } }, (r) => {
+    const key = process.env.GOOGLE_MAPS_KEY;
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&language=zh-TW&region=TW&key=${key}`;
+    https.get(url, (r) => {
       let data = "";
       r.on("data", c => data += c);
       r.on("end", () => {
         try {
-          const results = JSON.parse(data);
-          resolve(results[0] ? { lat: results[0].lat, lng: results[0].lon } : null);
+          const json = JSON.parse(data);
+          if (json.status === "OK" && json.results[0]) {
+            const loc = json.results[0].geometry.location;
+            resolve({ lat: loc.lat, lng: loc.lng });
+          } else {
+            resolve(null);
+          }
         } catch { resolve(null); }
       });
     }).on("error", () => resolve(null));
