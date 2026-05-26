@@ -49,6 +49,16 @@ app.use(express.json({ limit: "50mb" }));
 // 正確定位 lamps.db
 const db = new Database(LOCAL_DB);
 
+// tasks 資料表（任務清單，多人共用）
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    area    TEXT NOT NULL,
+    lamp_id TEXT NOT NULL,
+    added_at TEXT DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (area, lamp_id)
+  )
+`).run();
+
 // ------------------------------------------------------
 // 取得單一路燈
 // ------------------------------------------------------
@@ -126,6 +136,40 @@ app.get("/nearest", (req, res) => {
     id: nearest,
     distance: minDist
   });
+});
+
+// ------------------------------------------------------
+// 📋 任務清單 API
+// ------------------------------------------------------
+
+// 取得某區任務清單（含路燈資料）
+app.get("/tasks/:area", (req, res) => {
+  const tasks = db.prepare(`
+    SELECT t.lamp_id AS id, t.added_at,
+           l.address, l.lat, l.lng, l.watt, l.col
+    FROM tasks t
+    LEFT JOIN lamps l ON l.id = t.lamp_id
+    WHERE t.area = ?
+    ORDER BY t.added_at DESC
+  `).all(req.params.area);
+  res.json(tasks);
+});
+
+// 新增路燈到任務清單
+app.post("/tasks/:area", (req, res) => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: "缺少 id" });
+  const lamp = db.prepare("SELECT id FROM lamps WHERE id = ?").get(id);
+  if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
+  db.prepare("INSERT OR IGNORE INTO tasks (area, lamp_id) VALUES (?, ?)").run(req.params.area, id);
+  res.json({ ok: true });
+});
+
+// 從任務清單移除
+app.delete("/tasks/:area/:id", (req, res) => {
+  db.prepare("DELETE FROM tasks WHERE area = ? AND lamp_id = ?")
+    .run(req.params.area, decodeURIComponent(req.params.id));
+  res.json({ ok: true });
 });
 
 // ------------------------------------------------------
