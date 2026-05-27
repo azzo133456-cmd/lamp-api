@@ -230,6 +230,28 @@ function geocode(address) {
   });
 }
 
+// 行車路線（Google Directions API，後端轉發避免 key 外露）
+app.get("/directions", (req, res) => {
+  const { origin, destination, waypoints } = req.query;
+  if (!origin || !destination) return res.status(400).json({ error: "缺少起點或終點" });
+
+  const key = process.env.GOOGLE_MAPS_KEY;
+  let url = `https://maps.googleapis.com/maps/api/directions/json`
+    + `?origin=${encodeURIComponent(origin)}`
+    + `&destination=${encodeURIComponent(destination)}`
+    + `&language=zh-TW&region=TW&key=${key}`;
+  if (waypoints) url += `&waypoints=${encodeURIComponent(waypoints)}`;
+
+  https.get(url, (r) => {
+    let data = "";
+    r.on("data", c => data += c);
+    r.on("end", () => {
+      try { res.json(JSON.parse(data)); }
+      catch { res.status(500).json({ error: "解析失敗" }); }
+    });
+  }).on("error", () => res.status(500).json({ error: "連線失敗" }));
+});
+
 // 純地址定位（不寫入 db）
 app.get("/geocode", async (req, res) => {
   const q = req.query.q;
