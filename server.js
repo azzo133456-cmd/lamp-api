@@ -238,10 +238,16 @@ app.post("/tasks/:area/custom", async (req, res) => {
   res.json({ ok: true, task_id });
 });
 
-// 從任務清單移除
+// 從任務清單移除（單筆）
 app.delete("/tasks/:area/:id", (req, res) => {
   db.prepare("DELETE FROM tasks WHERE area = ? AND task_id = ?")
     .run(req.params.area, decodeURIComponent(req.params.id));
+  res.json({ ok: true });
+});
+
+// 清空整個區域的任務清單
+app.delete("/tasks/:area", (req, res) => {
+  db.prepare("DELETE FROM tasks WHERE area = ?").run(req.params.area);
   res.json({ ok: true });
 });
 
