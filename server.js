@@ -209,13 +209,24 @@ function geocode(address) {
             const loc = json.results[0].geometry.location;
             resolve({ lat: loc.lat, lng: loc.lng });
           } else {
-            resolve(null);
+            console.error("[geocode] Google status:", json.status, json.error_message || "");
+            resolve({ _error: json.status, _msg: json.error_message || "" });
           }
-        } catch { resolve(null); }
+        } catch (e) { console.error("[geocode] parse error", e); resolve(null); }
       });
     }).on("error", () => resolve(null));
   });
 }
+
+// 純地址定位（不寫入 db）
+app.get("/geocode", async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: "缺少 q 參數" });
+  const coords = await geocode(q);
+  if (!coords) return res.status(404).json({ error: "找不到此地址" });
+  if (coords._error) return res.status(502).json({ error: `Google Maps 錯誤：${coords._error}`, detail: coords._msg });
+  res.json(coords);
+});
 
 // 新增自訂地點（無路燈編號）；lat/lng 可省略，自動用地址定位
 app.post("/tasks/:area/custom", async (req, res) => {
