@@ -69,6 +69,7 @@ if (!taskCols.includes("is_custom")) db.prepare("ALTER TABLE tasks ADD COLUMN is
 if (!taskCols.includes("label"))     db.prepare("ALTER TABLE tasks ADD COLUMN label TEXT").run();
 if (!taskCols.includes("lat"))       db.prepare("ALTER TABLE tasks ADD COLUMN lat TEXT").run();
 if (!taskCols.includes("lng"))       db.prepare("ALTER TABLE tasks ADD COLUMN lng TEXT").run();
+if (!taskCols.includes("priority"))  db.prepare("ALTER TABLE tasks ADD COLUMN priority INTEGER DEFAULT 0").run();
 // 舊欄位 lamp_id 改名為 task_id（透過 RENAME 處理）
 if (taskCols.includes("lamp_id") && !taskCols.includes("task_id")) {
   db.prepare("ALTER TABLE tasks RENAME COLUMN lamp_id TO task_id").run();
@@ -157,10 +158,10 @@ app.get("/nearest", (req, res) => {
 // 📋 任務清單 API
 // ------------------------------------------------------
 
-// 取得某區任務清單
+// 取得某區任務清單（優先置頂）
 app.get("/tasks/:area", (req, res) => {
   const rows = db.prepare(`
-    SELECT t.task_id AS id, t.is_custom, t.label, t.added_at,
+    SELECT t.task_id AS id, t.is_custom, t.label, t.added_at, t.priority,
            COALESCE(t.lat, l.lat) AS lat,
            COALESCE(t.lng, l.lng) AS lng,
            COALESCE(t.label, l.address) AS address,
@@ -168,9 +169,20 @@ app.get("/tasks/:area", (req, res) => {
     FROM tasks t
     LEFT JOIN lamps l ON l.id = t.task_id AND t.is_custom = 0
     WHERE t.area = ?
-    ORDER BY t.added_at DESC
+    ORDER BY t.priority DESC, t.added_at DESC
   `).all(req.params.area);
   res.json(rows);
+});
+
+// 切換優先
+app.patch("/tasks/:area/:id/priority", (req, res) => {
+  const { area } = req.params;
+  const id = decodeURIComponent(req.params.id);
+  const task = db.prepare("SELECT priority FROM tasks WHERE area = ? AND task_id = ?").get(area, id);
+  if (!task) return res.status(404).json({ error: "找不到此任務" });
+  const newPriority = task.priority ? 0 : 1;
+  db.prepare("UPDATE tasks SET priority = ? WHERE area = ? AND task_id = ?").run(newPriority, area, id);
+  res.json({ ok: true, priority: newPriority });
 });
 
 // 新增路燈（支援單筆 { id } 或批次 { ids: [...] }）
