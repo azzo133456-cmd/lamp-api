@@ -70,6 +70,7 @@ if (!taskCols.includes("label"))     db.prepare("ALTER TABLE tasks ADD COLUMN la
 if (!taskCols.includes("lat"))       db.prepare("ALTER TABLE tasks ADD COLUMN lat TEXT").run();
 if (!taskCols.includes("lng"))       db.prepare("ALTER TABLE tasks ADD COLUMN lng TEXT").run();
 if (!taskCols.includes("priority"))  db.prepare("ALTER TABLE tasks ADD COLUMN priority INTEGER DEFAULT 0").run();
+if (!taskCols.includes("color"))     db.prepare("ALTER TABLE tasks ADD COLUMN color TEXT").run();
 // 舊欄位 lamp_id 改名為 task_id（透過 RENAME 處理）
 if (taskCols.includes("lamp_id") && !taskCols.includes("task_id")) {
   db.prepare("ALTER TABLE tasks RENAME COLUMN lamp_id TO task_id").run();
@@ -161,7 +162,7 @@ app.get("/nearest", (req, res) => {
 // 取得某區任務清單（優先置頂）
 app.get("/tasks/:area", (req, res) => {
   const rows = db.prepare(`
-    SELECT t.task_id AS id, t.is_custom, t.label, t.added_at, t.priority,
+    SELECT t.task_id AS id, t.is_custom, t.label, t.added_at, t.priority, t.color,
            COALESCE(t.lat, l.lat) AS lat,
            COALESCE(t.lng, l.lng) AS lng,
            COALESCE(t.label, l.address) AS address,
@@ -172,6 +173,15 @@ app.get("/tasks/:area", (req, res) => {
     ORDER BY t.priority DESC, t.added_at DESC
   `).all(req.params.area);
   res.json(rows);
+});
+
+// 設定顏色
+app.patch("/tasks/:area/:id/color", (req, res) => {
+  const { area } = req.params;
+  const id = decodeURIComponent(req.params.id);
+  const { color } = req.body;           // "#e53e3e" 或 null（重置預設）
+  db.prepare("UPDATE tasks SET color = ? WHERE area = ? AND task_id = ?").run(color || null, area, id);
+  res.json({ ok: true, color: color || null });
 });
 
 // 切換優先
