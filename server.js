@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import compression from "compression";
 import Database from "better-sqlite3";
 import fs from "fs";
 import https from "https";
@@ -43,6 +44,7 @@ if (!fs.existsSync(LOCAL_DB)) {
 // 建立 express app
 // ------------------------------------------------------
 const app = express();
+app.use(compression());   // gzip 壓縮回應（對 /tasks 大量 JSON 效果最明顯）
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
