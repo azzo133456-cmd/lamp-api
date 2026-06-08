@@ -683,7 +683,7 @@ app.post("/controllers/batch", (req, res) => {
 // 對 ID / controller_id / IMEI / IMSI 做 LIKE %term% 比對
 // POST body: { terms: [...] }；每個 term 至少 3 碼
 // ------------------------------------------------------
-const CTRL_SEARCH_FIELDS = ["ID", "controller_id", "controller_imei", "imsi"];
+const CTRL_SEARCH_FIELDS = ["ID", "controller_id"];
 const CTRL_PER_TERM_LIMIT = 100;
 
 app.post("/controllers/search", (req, res) => {

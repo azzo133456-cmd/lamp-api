@@ -25,15 +25,12 @@ db.pragma('journal_mode = WAL');
 db.prepare(`
   CREATE TABLE controllers (
     "ID" TEXT,
-    "controller_id" TEXT,
-    "controller_imei" TEXT,
-    "imsi" TEXT,
-    "重複" TEXT
+    "controller_id" TEXT
   )
 `).run();
 
-const insert = db.prepare(`INSERT INTO controllers ("ID","controller_id","controller_imei","imsi","重複") VALUES (?,?,?,?,?)`);
-const insertMany = db.transaction((rows) => { for (const r of rows) insert.run(r.id, r.cid, r.imei, r.imsi, r.dup); });
+const insert = db.prepare(`INSERT INTO controllers ("ID","controller_id") VALUES (?,?)`);
+const insertMany = db.transaction((rows) => { for (const r of rows) insert.run(r.id, r.cid); });
 
 const rl = readline.createInterface({ input: fs.createReadStream(SRC, 'utf8'), crlfDelay: Infinity });
 
@@ -43,10 +40,10 @@ for await (const line of rl) {
   if (!t.startsWith('|')) continue;
   if (t.includes('controller_id') || /^\|[\s-]*\|/.test(t)) { skipped++; continue; } // 標題/分隔列
   const cells = t.split('|').slice(1, -1).map(c => c.trim());
-  if (cells.length < 5) continue;
-  const [id, cid, imei, imsi, dup] = cells;
+  if (cells.length < 2) continue;
+  const [id, cid] = cells;
   if (!cid) continue;
-  batch.push({ id, cid, imei, imsi, dup });
+  batch.push({ id, cid });
   count++;
   if (batch.length >= 5000) { insertMany(batch); batch = []; }
 }
