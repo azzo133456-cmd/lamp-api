@@ -679,8 +679,71 @@ app.post("/controllers/batch", (req, res) => {
 });
 
 // ------------------------------------------------------
+// 📥 匯入智控總表 MD，整批重建 controllers 表（ID + controller_id）
+// 前端直接上傳 .md 原始文字；以總表為準，全量取代
+// body：text/plain（Markdown 表格內容）
+// ------------------------------------------------------
+function parseControllersMd(text) {
+  const rows = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t.startsWith("|")) continue;
+    if (t.includes("controller_id") || /^\|[\s-]*\|/.test(t)) continue; // 標題/分隔列
+    const cells = t.split("|").slice(1, -1).map(c => c.trim());
+    if (cells.length < 2) continue;
+    const [id, cid] = cells;
+    if (!cid) continue;
+    rows.push({ id, cid });
+  }
+  return rows;
+}
+
+app.post("/controllers/import-md",
+  express.text({ type: "*/*", limit: "50mb" }),
+  (req, res) => {
+    const text = typeof req.body === "string" ? req.body : "";
+    if (!text.trim()) return res.status(400).json({ error: "無內容（請上傳智控總表 MD）" });
+
+    const parsed = parseControllersMd(text);
+    if (parsed.length === 0) {
+      return res.status(400).json({ error: "解析不到任何資料列，請確認 MD 表格含 ID 與 controller_id 欄" });
+    }
+
+    let w = null;
+    try {
+      // 先關閉唯讀連線，改用可寫連線整批重建
+      if (dbControllers) { dbControllers.close(); dbControllers = null; }
+      w = new Database(LOCAL_CONTROLLERS_DB);
+      w.pragma("journal_mode = WAL");
+      w.prepare(`CREATE TABLE IF NOT EXISTS controllers ("ID" TEXT, "controller_id" TEXT)`).run();
+
+      const insert = w.prepare(`INSERT INTO controllers ("ID","controller_id") VALUES (?,?)`);
+      const rebuild = w.transaction((list) => {
+        w.prepare("DELETE FROM controllers").run();
+        for (const r of list) insert.run(r.id, r.cid);
+      });
+      rebuild(parsed);
+
+      w.prepare(`CREATE INDEX IF NOT EXISTS idx_controllers_id ON controllers("ID")`).run();
+      w.prepare(`CREATE INDEX IF NOT EXISTS idx_controllers_cid ON controllers("controller_id")`).run();
+      w.pragma("wal_checkpoint(TRUNCATE)");
+      w.close(); w = null;
+
+      openControllersDB(); // 重新以唯讀連線開啟
+      console.log(`[controllers/import-md] 整批重建 ${parsed.length} 筆`);
+      res.json({ ok: true, rows: parsed.length });
+    } catch (e) {
+      console.error("[controllers/import-md] 失敗：", e.message);
+      try { if (w) w.close(); } catch {}
+      openControllersDB(); // 盡量恢復唯讀連線
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+// ------------------------------------------------------
 // 📡 智控器模糊查詢（輸入部分碼 → 找出完整 ID）
-// 對 ID / controller_id / IMEI / IMSI 做 LIKE %term% 比對
+// 對 ID / controller_id 做 LIKE %term% 比對
 // POST body: { terms: [...] }；每個 term 至少 3 碼
 // ------------------------------------------------------
 const CTRL_SEARCH_FIELDS = ["ID", "controller_id"];
