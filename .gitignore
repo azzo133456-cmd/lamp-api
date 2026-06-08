@@ -1,1 +1,5 @@
 node_modules/
+# 含敏感 IMEI/IMSI，僅放 Railway Volume，不進公開 repo
+data/controllers.db
+data/controllers.db-shm
+data/controllers.db-wal

@@ -89,6 +89,31 @@ try {
 }
 
 // ------------------------------------------------------
+// 智控器總表（controllers）：controller_id / IMEI / IMSI 訊號資料
+// 因含敏感識別碼，不放公開 GitHub；改由 Railway Volume 持有，
+// 透過受 token 保護的 /admin/upload-controllers 端點一次性上傳。
+// 獨立檔案、獨立連線、唯讀，不影響其他資料表。
+// ------------------------------------------------------
+const LOCAL_CONTROLLERS_DB = "/app/data/controllers.db";
+
+let dbControllers = null;
+function openControllersDB() {
+  try {
+    if (dbControllers) { dbControllers.close(); dbControllers = null; }
+    if (!fs.existsSync(LOCAL_CONTROLLERS_DB)) {
+      console.log("controllers.db 尚未上傳至 Volume（查詢端點將回 503，請用 /admin/upload-controllers 上傳）");
+      return;
+    }
+    dbControllers = new Database(LOCAL_CONTROLLERS_DB, { readonly: true });
+    console.log("controllers.db connected. rows =", dbControllers.prepare("SELECT COUNT(*) c FROM controllers").get().c);
+  } catch (e) {
+    console.error("controllers.db 連線失敗（不影響其他既有功能）：", e.message);
+    dbControllers = null;
+  }
+}
+openControllersDB();
+
+// ------------------------------------------------------
 // 建立 express app
 // ------------------------------------------------------
 const app = express();
@@ -626,6 +651,71 @@ app.post("/lamps-full/batch", (req, res) => {
 
   res.json({ count: rows.length, results: rows, not_found });
 });
+
+// ------------------------------------------------------
+// 📡 智控器訊號查詢（controllers：controller_id / IMEI / IMSI）
+// 支援用「ID」或「controller_id」查詢，批次比對
+// POST body: { ids: [...] }
+// ------------------------------------------------------
+app.post("/controllers/batch", (req, res) => {
+  if (!dbControllers) return res.status(503).json({ error: "智控器資料庫尚未就緒，請稍後再試" });
+
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).map(s => s.trim()).filter(Boolean) : [];
+  if (ids.length === 0) return res.status(400).json({ error: "請提供 ids 陣列" });
+
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = dbControllers.prepare(
+    `SELECT * FROM controllers WHERE "ID" IN (${placeholders}) OR "controller_id" IN (${placeholders})`
+  ).all(...ids, ...ids);
+
+  const found = new Set();
+  for (const r of rows) {
+    found.add(r["ID"]);
+    found.add(r["controller_id"]);
+  }
+  const not_found = ids.filter(id => !found.has(id));
+
+  res.json({ count: rows.length, results: rows, not_found });
+});
+
+// ------------------------------------------------------
+// 🔐 一次性上傳 controllers.db 至 Railway Volume
+// 需設定環境變數 ADMIN_TOKEN，並於 header 帶 X-Admin-Token
+// 用法： curl -X POST <API>/admin/upload-controllers \
+//          -H "X-Admin-Token: <token>" \
+//          --data-binary @data/controllers.db
+// ------------------------------------------------------
+app.post("/admin/upload-controllers",
+  express.raw({ type: "*/*", limit: "300mb" }),
+  (req, res) => {
+    if (!process.env.ADMIN_TOKEN) {
+      return res.status(503).json({ error: "伺服器未設定 ADMIN_TOKEN，無法上傳" });
+    }
+    if (req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+      return res.status(401).json({ error: "未授權（X-Admin-Token 不正確）" });
+    }
+    if (!req.body || !req.body.length) {
+      return res.status(400).json({ error: "無檔案內容（請用 --data-binary 上傳）" });
+    }
+    try {
+      // 先寫到暫存檔再改名，避免上傳中斷造成半個檔案
+      const tmp = LOCAL_CONTROLLERS_DB + ".uploading";
+      fs.writeFileSync(tmp, req.body);
+      // 驗證確實是含 controllers 資料表的 sqlite
+      const test = new Database(tmp, { readonly: true });
+      const rows = test.prepare("SELECT COUNT(*) c FROM controllers").get().c;
+      test.close();
+      if (dbControllers) { dbControllers.close(); dbControllers = null; }
+      fs.renameSync(tmp, LOCAL_CONTROLLERS_DB);
+      openControllersDB();
+      console.log(`[admin] controllers.db 上傳完成，rows = ${rows}`);
+      res.json({ ok: true, rows });
+    } catch (e) {
+      console.error("[admin] controllers.db 上傳失敗：", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
 
 // ------------------------------------------------------
 // 啟動伺服器
