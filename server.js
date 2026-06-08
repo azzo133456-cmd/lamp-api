@@ -41,6 +41,45 @@ if (!fs.existsSync(LOCAL_DB)) {
 }
 
 // ------------------------------------------------------
+// 23 欄完整路燈清冊資料庫（lamps_full）
+// 獨立檔案、獨立連線、唯讀，完全不影響上面的 lamps.db / lamps 資料表
+// ------------------------------------------------------
+const FULL_DB_URL = "https://raw.githubusercontent.com/azzo133456-cmd/lamp-api/main/data/lamps_full.db";
+const LOCAL_FULL_DB = "/app/data/lamps_full.db";
+
+function downloadFullDB() {
+  return new Promise((resolve) => {
+    console.log("Downloading lamps_full.db from GitHub...");
+    const file = fs.createWriteStream(LOCAL_FULL_DB);
+    https.get(FULL_DB_URL, (res) => {
+      res.pipe(file);
+      file.on("finish", () => {
+        file.close(() => {
+          console.log("lamps_full.db downloaded.");
+          resolve();
+        });
+      });
+    });
+  });
+}
+
+if (!fs.existsSync(LOCAL_FULL_DB)) {
+  await downloadFullDB();
+} else {
+  console.log("lamps_full.db found in volume.");
+}
+
+// 用獨立連線開啟（readonly），即使這裡出錯也不會影響原本的 db
+let dbFull = null;
+try {
+  dbFull = new Database(LOCAL_FULL_DB, { readonly: true });
+  console.log("lamps_full.db connected. rows =", dbFull.prepare("SELECT COUNT(*) c FROM lamps_full").get().c);
+} catch (e) {
+  console.error("lamps_full.db 連線失敗（不影響其他既有功能）：", e.message);
+  dbFull = null;
+}
+
+// ------------------------------------------------------
 // 建立 express app
 // ------------------------------------------------------
 const app = express();
@@ -481,6 +520,35 @@ app.post("/import", (req, res) => {
     console.error("[import] 錯誤：", e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ------------------------------------------------------
+// 23 欄完整資料查詢（新增 endpoint，純附加，不更動原有路由）
+// ------------------------------------------------------
+app.get("/lamp-full/:id", (req, res) => {
+  if (!dbFull) return res.status(503).json({ error: "完整資料庫尚未就緒，請稍後再試" });
+  let id = req.params.id.trim();
+  id = decodeURIComponent(id);
+
+  const row = dbFull.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?').get(id);
+  if (!row) return res.status(404).json({ error: "查無此路燈編號" });
+
+  res.json(row);
+});
+
+app.post("/lamps-full/batch", (req, res) => {
+  if (!dbFull) return res.status(503).json({ error: "完整資料庫尚未就緒，請稍後再試" });
+
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).map(s => s.trim()).filter(Boolean) : [];
+  if (ids.length === 0) return res.status(400).json({ error: "請提供 ids 陣列" });
+
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = dbFull.prepare(`SELECT * FROM lamps_full WHERE "路燈編號" IN (${placeholders})`).all(...ids);
+
+  const found = new Set(rows.map(r => r["路燈編號"]));
+  const not_found = ids.filter(id => !found.has(id));
+
+  res.json({ count: rows.length, results: rows, not_found });
 });
 
 // ------------------------------------------------------
