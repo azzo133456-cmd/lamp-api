@@ -679,6 +679,49 @@ app.post("/controllers/batch", (req, res) => {
 });
 
 // ------------------------------------------------------
+// 📡 智控器模糊查詢（輸入部分碼 → 找出完整 ID）
+// 對 ID / controller_id / IMEI / IMSI 做 LIKE %term% 比對
+// POST body: { terms: [...] }；每個 term 至少 3 碼
+// ------------------------------------------------------
+const CTRL_SEARCH_FIELDS = ["ID", "controller_id", "controller_imei", "imsi"];
+const CTRL_PER_TERM_LIMIT = 100;
+
+app.post("/controllers/search", (req, res) => {
+  if (!dbControllers) return res.status(503).json({ error: "智控器資料庫尚未就緒，請稍後再試" });
+
+  const raw = Array.isArray(req.body?.terms) ? req.body.terms
+            : Array.isArray(req.body?.ids)   ? req.body.ids   // 相容舊參數名
+            : [];
+  const terms = raw.map(String).map(s => s.trim()).filter(Boolean);
+  if (terms.length === 0) return res.status(400).json({ error: "請提供 terms 陣列" });
+
+  const where = CTRL_SEARCH_FIELDS.map(f => `"${f}" LIKE ?`).join(" OR ");
+  const stmt = dbControllers.prepare(
+    `SELECT * FROM controllers WHERE ${where} LIMIT ${CTRL_PER_TERM_LIMIT + 1}`
+  );
+
+  const seen = new Set();          // 以 controller_id 去重
+  const results = [];
+  const not_found = [];            // 查無資料的 term
+  const too_short = [];            // 少於 3 碼，未查詢
+  const truncated = [];            // 命中超過上限、僅回傳前 100 筆的 term
+
+  for (const t of terms) {
+    if (t.length < 3) { too_short.push(t); continue; }
+    const like = `%${t}%`;
+    const rows = stmt.all(...CTRL_SEARCH_FIELDS.map(() => like));
+    if (rows.length === 0) { not_found.push(t); continue; }
+    if (rows.length > CTRL_PER_TERM_LIMIT) truncated.push(t);
+    for (const r of rows.slice(0, CTRL_PER_TERM_LIMIT)) {
+      const key = r.controller_id || JSON.stringify(r);
+      if (!seen.has(key)) { seen.add(key); results.push(r); }
+    }
+  }
+
+  res.json({ count: results.length, results, not_found, too_short, truncated });
+});
+
+// ------------------------------------------------------
 // 🔐 一次性上傳 controllers.db 至 Railway Volume
 // 需設定環境變數 ADMIN_TOKEN，並於 header 帶 X-Admin-Token
 // 用法： curl -X POST <API>/admin/upload-controllers \
