@@ -79,6 +79,15 @@ try {
   dbFull = null;
 }
 
+// 另開一條可寫連線，僅供「匯入回填」端點使用（與上面唯讀連線互不影響）
+let dbFullWrite = null;
+try {
+  dbFullWrite = new Database(LOCAL_FULL_DB);
+} catch (e) {
+  console.error("lamps_full.db 可寫連線失敗（匯入功能將無法使用）：", e.message);
+  dbFullWrite = null;
+}
+
 // ------------------------------------------------------
 // 建立 express app
 // ------------------------------------------------------
@@ -534,6 +543,73 @@ app.get("/lamp-full/:id", (req, res) => {
   if (!row) return res.status(404).json({ error: "查無此路燈編號" });
 
   res.json(row);
+});
+
+// ------------------------------------------------------
+// 📥 匯入 Excel 回填完整路燈清冊（lamps_full，UPSERT，依「路燈編號」新增或更新）
+// POST body: { rows: [ { 路燈編號, 行政區, ... 24 欄 }, ... ] }
+// 規則：Excel 中有填值的欄位才會覆蓋資料庫，留白欄位保留資料庫原值（新增的路燈則留白欄位存為空字串）
+// row 中沒有「路燈編號」者會被忽略
+// ------------------------------------------------------
+const FULL_COLUMNS = ['路燈編號','行政區','里','詳細位置','經度','緯度','燈桿類型','燈桿型式','燈桿廠牌','燈具編號',
+                      '燈具種類','瓦特數','色溫','新裝絕緣值','新裝接地值','路燈性質','控制器編號',
+                      '計劃類別','計劃名稱','主要廠商','更新時間','是否啟用','是否廢止','是否自主審核通過'];
+
+app.post("/lamps-full/import", (req, res) => {
+  if (!dbFullWrite) return res.status(503).json({ error: "完整資料庫尚未就緒，請稍後再試" });
+
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (rows.length === 0) return res.status(400).json({ error: "請提供 rows 陣列" });
+
+  const mapped = [];
+  const skipped = [];
+  for (const raw of rows) {
+    const id = raw?.['路燈編號'] != null ? String(raw['路燈編號']).trim() : '';
+    if (!id) { skipped.push(raw); continue; }
+    const row = { 路燈編號: id };
+    for (const col of FULL_COLUMNS) {
+      if (col === '路燈編號') continue;
+      const v = raw[col];
+      const s = (v === undefined || v === null) ? '' : String(v).trim();
+      if (s !== '') row[col] = s;
+    }
+    mapped.push(row);
+  }
+
+  if (mapped.length === 0) {
+    return res.status(400).json({ error: "資料中找不到「路燈編號」欄位，請確認 Excel 標題列" });
+  }
+
+  try {
+    const select = dbFullWrite.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?');
+    const del    = dbFullWrite.prepare('DELETE FROM lamps_full WHERE "路燈編號" = @路燈編號');
+    const placeholders = FULL_COLUMNS.map(c => `@${c}`).join(", ");
+    const cols = FULL_COLUMNS.map(c => `"${c}"`).join(", ");
+    const insert = dbFullWrite.prepare(`INSERT INTO lamps_full (${cols}) VALUES (${placeholders})`);
+
+    let added = 0, updated = 0;
+    const importAll = dbFullWrite.transaction((list) => {
+      for (const r of list) {
+        const existing = select.get(r.路燈編號);
+        const final = { 路燈編號: r.路燈編號 };
+        for (const col of FULL_COLUMNS) {
+          if (col === '路燈編號') continue;
+          if (col in r) final[col] = r[col];
+          else final[col] = existing ? (existing[col] ?? '') : '';
+        }
+        del.run(final);
+        insert.run(final);
+        if (existing) updated++; else added++;
+      }
+    });
+    importAll(mapped);
+
+    console.log(`[lamps-full/import] 新增 ${added} 筆、更新 ${updated} 筆，略過 ${skipped.length} 筆`);
+    res.json({ ok: true, added, updated, skipped: skipped.length, total: mapped.length });
+  } catch (e) {
+    console.error("[lamps-full/import] 錯誤：", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/lamps-full/batch", (req, res) => {
