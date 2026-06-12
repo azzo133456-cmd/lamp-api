@@ -375,6 +375,47 @@ app.get("/geocode", async (req, res) => {
   res.json(coords);
 });
 
+// ------------------------------------------------------
+// 📷 截圖文字辨識（Google Cloud Vision OCR，後端轉發避免 key 外露）
+// body: { image: "<base64>" }（不含 data:image/...;base64, 前綴）
+// ------------------------------------------------------
+app.post("/ocr", (req, res) => {
+  const image = req.body?.image;
+  if (!image) return res.status(400).json({ error: "缺少 image（base64）" });
+
+  const key = process.env.GOOGLE_MAPS_KEY;
+  const payload = JSON.stringify({
+    requests: [{
+      image: { content: image },
+      features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
+      imageContext: { languageHints: ["zh-TW"] }
+    }]
+  });
+
+  const reqVision = https.request(
+    `https://vision.googleapis.com/v1/images:annotate?key=${key}`,
+    { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } },
+    (r) => {
+      let data = "";
+      r.on("data", c => data += c);
+      r.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.responses?.[0];
+          if (result?.error) return res.status(502).json({ error: result.error.message || "Vision API 錯誤" });
+          const text = result?.fullTextAnnotation?.text || "";
+          res.json({ text });
+        } catch (e) {
+          res.status(500).json({ error: "解析失敗" });
+        }
+      });
+    }
+  );
+  reqVision.on("error", () => res.status(500).json({ error: "連線失敗" }));
+  reqVision.write(payload);
+  reqVision.end();
+});
+
 // 新增自訂地點（無路燈編號）；lat/lng 可省略，自動用地址定位
 app.post("/tasks/:area/custom", async (req, res) => {
   let { label, lat, lng } = req.body;
