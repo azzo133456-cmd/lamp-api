@@ -6,6 +6,8 @@ import fs from "fs";
 import https from "https";
 import path from "path";
 import { fileURLToPath } from "url";
+import webpush from "web-push";
+import cron from "node-cron";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,6 +152,32 @@ if (!taskCols.includes("color"))     db.prepare("ALTER TABLE tasks ADD COLUMN co
 if (taskCols.includes("lamp_id") && !taskCols.includes("task_id")) {
   db.prepare("ALTER TABLE tasks RENAME COLUMN lamp_id TO task_id").run();
 }
+
+// site_visits 資料表（會勘排程：日期+時間+地點+備註，與路燈無關）
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS site_visits (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    area        TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    visit_date  TEXT NOT NULL,
+    visit_time  TEXT,
+    note        TEXT,
+    notified    INTEGER DEFAULT 0,
+    created_at  TEXT DEFAULT (datetime('now','localtime'))
+  )
+`).run();
+
+// push_subscriptions 資料表（Web Push 訂閱資訊）
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    area         TEXT NOT NULL,
+    endpoint     TEXT NOT NULL UNIQUE,
+    p256dh       TEXT NOT NULL,
+    auth         TEXT NOT NULL,
+    created_at   TEXT DEFAULT (datetime('now','localtime'))
+  )
+`).run();
 
 // ------------------------------------------------------
 // 取得單一路燈
@@ -822,6 +850,128 @@ app.post("/admin/upload-controllers",
     }
   }
 );
+
+// ------------------------------------------------------
+// 📅 會勘排程 API（site_visits：日期+時間+地點+備註，與路燈無關）
+// ------------------------------------------------------
+
+// 取得某區會勘排程清單
+app.get("/visits/:area", (req, res) => {
+  const rows = db.prepare(`
+    SELECT id, area, label, visit_date, visit_time, note, notified, created_at
+    FROM site_visits
+    WHERE area = ?
+    ORDER BY visit_date ASC, visit_time ASC
+  `).all(req.params.area);
+  res.json(rows);
+});
+
+// 新增會勘排程
+app.post("/visits/:area", (req, res) => {
+  const { label, visit_date, visit_time, note } = req.body ?? {};
+  if (!label || !visit_date) return res.status(400).json({ error: "請輸入地點/標籤與日期" });
+
+  const result = db.prepare(`
+    INSERT INTO site_visits (area, label, visit_date, visit_time, note)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(req.params.area, label, visit_date, visit_time || null, note || null);
+
+  res.json({ ok: true, id: result.lastInsertRowid });
+});
+
+// 刪除會勘排程
+app.delete("/visits/:area/:id", (req, res) => {
+  db.prepare("DELETE FROM site_visits WHERE area = ? AND id = ?")
+    .run(req.params.area, req.params.id);
+  res.json({ ok: true });
+});
+
+// ------------------------------------------------------
+// 🔔 Web Push 推播
+// ------------------------------------------------------
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails("mailto:azzo133456@gmail.com", VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn("[push] 未設定 VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY，推播功能將無法使用");
+}
+
+// 取得 VAPID 公鑰（前端訂閱用）
+app.get("/push/vapid-public-key", (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(503).json({ error: "伺服器尚未設定推播金鑰" });
+  res.json({ key: VAPID_PUBLIC_KEY });
+});
+
+// 註冊推播訂閱
+app.post("/push/subscribe", (req, res) => {
+  const { area, subscription } = req.body ?? {};
+  if (!area || !subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+    return res.status(400).json({ error: "缺少 area 或 subscription 資料" });
+  }
+  db.prepare(`
+    INSERT OR REPLACE INTO push_subscriptions (area, endpoint, p256dh, auth)
+    VALUES (?, ?, ?, ?)
+  `).run(area, subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth);
+  res.json({ ok: true });
+});
+
+// 取消推播訂閱
+app.post("/push/unsubscribe", (req, res) => {
+  const { endpoint } = req.body ?? {};
+  if (!endpoint) return res.status(400).json({ error: "缺少 endpoint" });
+  db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(endpoint);
+  res.json({ ok: true });
+});
+
+// 發送推播給某區所有訂閱者
+async function sendPushToArea(area, payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  const subs = db.prepare("SELECT * FROM push_subscriptions WHERE area = ?").all(area);
+  for (const sub of subs) {
+    const pushSub = {
+      endpoint: sub.endpoint,
+      keys: { p256dh: sub.p256dh, auth: sub.auth }
+    };
+    try {
+      await webpush.sendNotification(pushSub, JSON.stringify(payload));
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(sub.endpoint);
+      } else {
+        console.error("[push] 發送失敗：", e.message);
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------
+// ⏰ 排程任務：每天下午 4 點檢查「明天」的會勘並推播
+// ------------------------------------------------------
+async function checkAndNotifyVisits() {
+  const now = new Date();
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const tomorrowStr = tomorrow.toISOString().slice(0, 10); // YYYY-MM-DD
+
+  const rows = db.prepare(`
+    SELECT * FROM site_visits WHERE visit_date = ? AND notified = 0
+  `).all(tomorrowStr);
+
+  for (const v of rows) {
+    await sendPushToArea(v.area, {
+      title: "明天有會勘排程",
+      body: `${v.label}${v.visit_time ? `　${v.visit_time}` : ""}${v.note ? `\n${v.note}` : ""}`,
+      tag: `visit-${v.id}`
+    });
+    db.prepare("UPDATE site_visits SET notified = 1 WHERE id = ?").run(v.id);
+  }
+  if (rows.length) console.log(`[visits] 推播 ${rows.length} 筆明日會勘`);
+}
+
+// 每天下午 4:00（伺服器本地時間）檢查一次
+cron.schedule("0 16 * * *", () => {
+  checkAndNotifyVisits().catch(e => console.error("[visits] 推播檢查失敗：", e.message));
+});
 
 // ------------------------------------------------------
 // 啟動伺服器
