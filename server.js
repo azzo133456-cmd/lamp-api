@@ -898,6 +898,16 @@ app.post("/admin/upload-controllers",
 
 // 取得某區會勘排程清單
 app.get("/visits/:area", (req, res) => {
+  // 已過期（日期早於今天，或當天時間已過）的會勘排程自動清除
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const nowTime = now.toTimeString().slice(0, 5); // HH:MM
+  db.prepare(`
+    DELETE FROM site_visits
+    WHERE area = ?
+      AND (visit_date < ? OR (visit_date = ? AND visit_time IS NOT NULL AND visit_time != '' AND visit_time < ?))
+  `).run(req.params.area, today, today, nowTime);
+
   const rows = db.prepare(`
     SELECT id, area, label, visit_date, visit_time, note, notified, created_at
     FROM site_visits
