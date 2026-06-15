@@ -896,12 +896,22 @@ app.post("/admin/upload-controllers",
 // 📅 會勘排程 API（site_visits：日期+時間+地點+備註，與路燈無關）
 // ------------------------------------------------------
 
+// 取得台灣當地日期/時間（伺服器可能跑在 UTC，需轉換避免跨日誤判）
+function taiwanDateTime(date = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Taipei",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  });
+  const parts = {};
+  for (const p of fmt.formatToParts(date)) parts[p.type] = p.value;
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+}
+
 // 取得某區會勘排程清單
 app.get("/visits/:area", (req, res) => {
   // 已過期（日期早於今天，或當天時間已過）的會勘排程自動清除
-  const now = new Date();
-  const today = now.toISOString().slice(0, 10);
-  const nowTime = now.toTimeString().slice(0, 5); // HH:MM
+  const { date: today, time: nowTime } = taiwanDateTime();
   db.prepare(`
     DELETE FROM site_visits
     WHERE area = ?
@@ -1000,9 +1010,8 @@ async function sendPushToArea(area, payload) {
 // ⏰ 排程任務：每天下午 4 點檢查「明天」的會勘並推播
 // ------------------------------------------------------
 async function checkAndNotifyVisits() {
-  const now = new Date();
-  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  const tomorrowStr = tomorrow.toISOString().slice(0, 10); // YYYY-MM-DD
+  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  const tomorrowStr = taiwanDateTime(tomorrow).date; // YYYY-MM-DD
 
   const rows = db.prepare(`
     SELECT * FROM site_visits WHERE visit_date = ? AND notified = 0
@@ -1019,10 +1028,10 @@ async function checkAndNotifyVisits() {
   if (rows.length) console.log(`[visits] 推播 ${rows.length} 筆明日會勘`);
 }
 
-// 每天下午 4:00（伺服器本地時間）檢查一次
+// 每天下午 4:00（台灣時間）檢查一次
 cron.schedule("0 16 * * *", () => {
   checkAndNotifyVisits().catch(e => console.error("[visits] 推播檢查失敗：", e.message));
-});
+}, { timezone: "Asia/Taipei" });
 
 // ------------------------------------------------------
 // 啟動伺服器
