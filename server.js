@@ -91,6 +91,47 @@ try {
 }
 
 // ------------------------------------------------------
+// 路燈開關箱資料庫（switchboxes）：開關箱編號 / 位置 / 座標 等 10 欄
+// 獨立檔案、獨立連線，比照 lamps_full；首次部署自 GitHub 下載，之後用 Volume 版本
+// ------------------------------------------------------
+const SB_DB_URL = "https://raw.githubusercontent.com/azzo133456-cmd/lamp-api/main/data/switchboxes.db";
+const LOCAL_SB_DB = "/app/data/switchboxes.db";
+
+function downloadSbDB() {
+  return new Promise((resolve) => {
+    console.log("Downloading switchboxes.db from GitHub...");
+    const file = fs.createWriteStream(LOCAL_SB_DB);
+    https.get(SB_DB_URL, (res) => {
+      res.pipe(file);
+      file.on("finish", () => file.close(() => { console.log("switchboxes.db downloaded."); resolve(); }));
+    });
+  });
+}
+
+if (!fs.existsSync(LOCAL_SB_DB)) {
+  await downloadSbDB();
+} else {
+  console.log("switchboxes.db found in volume.");
+}
+
+let dbSb = null;
+try {
+  dbSb = new Database(LOCAL_SB_DB, { readonly: true });
+  console.log("switchboxes.db connected. rows =", dbSb.prepare("SELECT COUNT(*) c FROM switchboxes").get().c);
+} catch (e) {
+  console.error("switchboxes.db 連線失敗（不影響其他既有功能）：", e.message);
+  dbSb = null;
+}
+
+let dbSbWrite = null;
+try {
+  dbSbWrite = new Database(LOCAL_SB_DB);
+} catch (e) {
+  console.error("switchboxes.db 可寫連線失敗（匯入功能將無法使用）：", e.message);
+  dbSbWrite = null;
+}
+
+// ------------------------------------------------------
 // 智控器總表（controllers）：controller_id / IMEI / IMSI 訊號資料
 // 因含敏感識別碼，不放公開 GitHub；改由 Railway Volume 持有，
 // 透過受 token 保護的 /admin/upload-controllers 端點一次性上傳。
@@ -719,6 +760,92 @@ app.post("/lamps-full/batch", (req, res) => {
   const not_found = ids.filter(id => !found.has(id));
 
   res.json({ count: rows.length, results: rows, not_found });
+});
+
+// ------------------------------------------------------
+// 🔌 路燈開關箱查詢（switchboxes，依「開關箱編號」批次查詢）
+// POST body: { ids: [...] }
+// ------------------------------------------------------
+const SB_COLUMNS = ["開關箱編號","行政區","詳細位置","經度","緯度","計畫類別","計畫名稱","主要廠商","開關箱型式","是否啟用"];
+
+app.post("/switchboxes/batch", (req, res) => {
+  if (!dbSb) return res.status(503).json({ error: "開關箱資料庫尚未就緒，請稍後再試" });
+
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).map(s => s.trim()).filter(Boolean) : [];
+  if (ids.length === 0) return res.status(400).json({ error: "請提供 ids 陣列" });
+
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = dbSb.prepare(`SELECT * FROM switchboxes WHERE "開關箱編號" IN (${placeholders})`).all(...ids);
+
+  const found = new Set(rows.map(r => r["開關箱編號"]));
+  const not_found = ids.filter(id => !found.has(id));
+
+  res.json({ count: rows.length, results: rows, not_found });
+});
+
+// ------------------------------------------------------
+// 📥 匯入 Excel 更新開關箱清冊（UPSERT，依「開關箱編號」新增或更新）
+// POST body: { rows: [ { 開關箱編號, 行政區, ... }, ... ] }
+// 規則：Excel 中有填值的欄位才覆蓋，留白欄位保留原值（新增者留白存為空字串）
+// 註：Render 磁碟可能非永久，此匯入為即時更新；長久保存請重建 db 並 commit 至 GitHub
+// ------------------------------------------------------
+app.post("/switchboxes/import", (req, res) => {
+  if (!dbSbWrite) return res.status(503).json({ error: "開關箱資料庫尚未就緒，請稍後再試" });
+
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (rows.length === 0) return res.status(400).json({ error: "請提供 rows 陣列" });
+
+  dbSbWrite.prepare(`CREATE TABLE IF NOT EXISTS switchboxes (${SB_COLUMNS.map(c => `"${c}" TEXT`).join(", ")})`).run();
+
+  const mapped = [];
+  const skipped = [];
+  for (const raw of rows) {
+    const id = raw?.["開關箱編號"] != null ? String(raw["開關箱編號"]).trim() : "";
+    if (!id) { skipped.push(raw); continue; }
+    const row = { 開關箱編號: id };
+    for (const col of SB_COLUMNS) {
+      if (col === "開關箱編號") continue;
+      const v = raw[col];
+      const s = (v === undefined || v === null) ? "" : String(v).trim();
+      if (s !== "") row[col] = s;
+    }
+    mapped.push(row);
+  }
+
+  if (mapped.length === 0) {
+    return res.status(400).json({ error: "資料中找不到「開關箱編號」欄位，請確認 Excel 標題列" });
+  }
+
+  try {
+    const select = dbSbWrite.prepare('SELECT * FROM switchboxes WHERE "開關箱編號" = ?');
+    const del    = dbSbWrite.prepare('DELETE FROM switchboxes WHERE "開關箱編號" = @開關箱編號');
+    const cols = SB_COLUMNS.map(c => `"${c}"`).join(", ");
+    const placeholders = SB_COLUMNS.map(c => `@${c}`).join(", ");
+    const insert = dbSbWrite.prepare(`INSERT INTO switchboxes (${cols}) VALUES (${placeholders})`);
+
+    let added = 0, updated = 0;
+    const importAll = dbSbWrite.transaction((list) => {
+      for (const r of list) {
+        const existing = select.get(r.開關箱編號);
+        const final = { 開關箱編號: r.開關箱編號 };
+        for (const col of SB_COLUMNS) {
+          if (col === "開關箱編號") continue;
+          if (col in r) final[col] = r[col];
+          else final[col] = existing ? (existing[col] ?? "") : "";
+        }
+        del.run(final);
+        insert.run(final);
+        if (existing) updated++; else added++;
+      }
+    });
+    importAll(mapped);
+
+    console.log(`[switchboxes/import] 新增 ${added} 筆、更新 ${updated} 筆，略過 ${skipped.length} 筆`);
+    res.json({ ok: true, added, updated, skipped: skipped.length, total: mapped.length });
+  } catch (e) {
+    console.error("[switchboxes/import] 錯誤：", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ------------------------------------------------------
