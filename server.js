@@ -223,11 +223,24 @@ db.prepare(`
 // ------------------------------------------------------
 // 取得單一路燈
 // ------------------------------------------------------
+// 從合併後的 lamps_full 讀單筆，對應回地圖 app 慣用的英文欄位
+// （中文欄 緯度/經度/瓦特數/色溫/詳細位置 → lat/lng/watt/col/address）
+// dbFull 未就緒或查無時，退回舊 lamps 表，確保地圖 app 不受影響
+function getLampBasic(id) {
+  if (dbFull) {
+    const r = dbFull.prepare(
+      'SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ?'
+    ).get(id);
+    if (r) return r;
+  }
+  return db.prepare("SELECT id, address, lat, lng, watt, col FROM lamps WHERE id = ?").get(id);
+}
+
 app.get("/lamp/:id", (req, res) => {
   let id = req.params.id.trim();
   id = decodeURIComponent(id);
 
-  const lamp = db.prepare("SELECT * FROM lamps WHERE id = ?").get(id);
+  const lamp = getLampBasic(id);
 
   if (!lamp) {
     return res.status(404).json({ error: "查無此路燈編號" });
@@ -273,17 +286,17 @@ app.get("/nearest", (req, res) => {
     return res.json({ error: "缺少經緯度參數" });
   }
 
-  const lamps = db.prepare("SELECT id, lat, lng FROM lamps").all();
+  const lamps = dbFull
+    ? dbFull.prepare('SELECT "路燈編號" AS id, "緯度" AS lat, "經度" AS lng FROM lamps_full').all()
+    : db.prepare("SELECT id, lat, lng FROM lamps").all();
 
   let nearest = null;
   let minDist = Infinity;
 
   for (const lamp of lamps) {
-    // ⚠ 依照你的資料庫格式：
-    // lamp.lat = 經度
-    // lamp.lng = 緯度
     const lampLat = Number(lamp.lat); // 緯度
     const lampLng = Number(lamp.lng); // 經度
+    if (!lampLat || !lampLng || isNaN(lampLat) || isNaN(lampLng)) continue; // 略過無座標的點
 
     const d = distance(userLat, userLng, lampLat, lampLng);
 
@@ -305,17 +318,36 @@ app.get("/nearest", (req, res) => {
 
 // 取得某區任務清單（優先置頂）
 app.get("/tasks/:area", (req, res) => {
-  const rows = db.prepare(`
-    SELECT t.task_id AS id, t.is_custom, t.label, t.added_at, t.priority, t.color,
-           COALESCE(t.lat, l.lat) AS lat,
-           COALESCE(t.lng, l.lng) AS lng,
-           COALESCE(t.label, l.address) AS address,
-           l.watt, l.col
-    FROM tasks t
-    LEFT JOIN lamps l ON l.id = t.task_id AND t.is_custom = 0
-    WHERE t.area = ?
-    ORDER BY t.priority DESC, t.added_at DESC
+  const tasks = db.prepare(`
+    SELECT task_id AS id, is_custom, label, added_at, priority, color, lat, lng
+    FROM tasks
+    WHERE area = ?
+    ORDER BY priority DESC, added_at DESC
   `).all(req.params.area);
+
+  // 非自訂點：批次向合併庫（lamps_full，退回舊 lamps）查座標/地址/瓦數/色溫，程式端 join
+  const lampIds = tasks.filter(t => !t.is_custom).map(t => t.id);
+  const lampMap = {};
+  if (lampIds.length) {
+    const ph = lampIds.map(() => "?").join(",");
+    const list = dbFull
+      ? dbFull.prepare(`SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" IN (${ph})`).all(...lampIds)
+      : db.prepare(`SELECT id, address, lat, lng, watt, col FROM lamps WHERE id IN (${ph})`).all(...lampIds);
+    for (const r of list) lampMap[r.id] = r;
+  }
+
+  const rows = tasks.map(t => {
+    const l = t.is_custom ? null : lampMap[t.id];
+    return {
+      id: t.id, is_custom: t.is_custom, label: t.label,
+      added_at: t.added_at, priority: t.priority, color: t.color,
+      lat: t.lat ?? (l ? l.lat : null),
+      lng: t.lng ?? (l ? l.lng : null),
+      address: t.label ?? (l ? l.address : null),
+      watt: l ? l.watt : null,
+      col: l ? l.col : null,
+    };
+  });
   res.json(rows);
 });
 
@@ -348,11 +380,14 @@ app.post("/tasks/:area", (req, res) => {
   const insert = db.prepare("INSERT OR IGNORE INTO tasks (area, task_id) VALUES (?, ?)");
   const results = { ok: 0, notFound: [] };
 
+  const existsInFull = dbFull ? dbFull.prepare('SELECT 1 FROM lamps_full WHERE "路燈編號" = ?') : null;
+  const existsInLamps = db.prepare("SELECT 1 FROM lamps WHERE id = ?");
   const run = db.transaction(() => {
     for (const lampId of list) {
-      const lamp = db.prepare("SELECT id FROM lamps WHERE id = ?").get(lampId.trim());
-      if (!lamp) { results.notFound.push(lampId); continue; }
-      insert.run(req.params.area, lampId.trim());
+      const key = lampId.trim();
+      const found = (existsInFull && existsInFull.get(key)) || existsInLamps.get(key);
+      if (!found) { results.notFound.push(lampId); continue; }
+      insert.run(req.params.area, key);
       results.ok++;
     }
   });
@@ -496,10 +531,30 @@ app.delete("/tasks/:area", (req, res) => {
 // ------------------------------------------------------
 app.patch("/lamp/:id", (req, res) => {
   let id = decodeURIComponent(req.params.id.trim());
+  const { address, lat, lng, watt, col } = req.body;
+
+  // 主庫為合併後的 lamps_full，編輯寫入中文欄位（只覆蓋有帶值的欄位）
+  if (dbFullWrite) {
+    const cur = dbFullWrite.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?').get(id);
+    if (cur) {
+      dbFullWrite.prepare(
+        'UPDATE lamps_full SET "詳細位置"=@address, "緯度"=@lat, "經度"=@lng, "瓦特數"=@watt, "色溫"=@col WHERE "路燈編號"=@id'
+      ).run({
+        id,
+        address: address !== undefined ? address    : cur["詳細位置"],
+        lat:     lat     !== undefined ? String(lat) : cur["緯度"],
+        lng:     lng     !== undefined ? String(lng) : cur["經度"],
+        watt:    watt    !== undefined ? String(watt): cur["瓦特數"],
+        col:     col     !== undefined ? String(col) : cur["色溫"],
+      });
+      console.log(`[edit] ${id} updated (lamps_full)`);
+      return res.json({ ok: true });
+    }
+  }
+
+  // 退路：dbFullWrite 未就緒或該編號只在舊表時，改寫舊 lamps
   const lamp = db.prepare("SELECT * FROM lamps WHERE id = ?").get(id);
   if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
-
-  const { address, lat, lng, watt, col } = req.body;
   db.prepare(`UPDATE lamps SET address=@address, lat=@lat, lng=@lng, watt=@watt, col=@col WHERE id=@id`).run({
     id,
     address: address !== undefined ? address : lamp.address,
@@ -508,8 +563,7 @@ app.patch("/lamp/:id", (req, res) => {
     watt:    watt    !== undefined ? watt    : lamp.watt,
     col:     col     !== undefined ? col     : lamp.col,
   });
-
-  console.log(`[edit] ${id} updated`);
+  console.log(`[edit] ${id} updated (lamps fallback)`);
   res.json({ ok: true });
 });
 
@@ -635,30 +689,39 @@ app.post("/import", (req, res) => {
     return res.status(400).json({ error: "篩選後無符合資料，請確認欄位名稱或行政區設定" });
   }
 
-  try {
-    const del    = db.prepare("DELETE FROM lamps WHERE id = @id");
-    const insert = db.prepare(`
-      INSERT INTO lamps (id, address, lat, lng, watt, col)
-      VALUES (@id, @address, @lat, @lng, @watt, @col)
-    `);
+  const writer = dbFullWrite;
+  if (!writer) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
 
-    const importAll = db.transaction((rows) => {
+  try {
+    // 英文欄 → 合併庫（lamps_full）中文欄；UPSERT 保留既有詳細欄位，只覆蓋有帶值的基本欄
+    const select = writer.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?');
+    const del    = writer.prepare('DELETE FROM lamps_full WHERE "路燈編號" = @路燈編號');
+    const cols   = FULL_COLUMNS.map(c => `"${c}"`).join(", ");
+    const ph     = FULL_COLUMNS.map(c => `@${c}`).join(", ");
+    const insert = writer.prepare(`INSERT INTO lamps_full (${cols}) VALUES (${ph})`);
+    const basicMap = { address: "詳細位置", lat: "緯度", lng: "經度", watt: "瓦特數", col: "色溫" };
+
+    const importAll = writer.transaction((rows) => {
       for (const r of rows) {
-        const row = {
-          id:      r.id      ?? null,
-          address: r.address ?? null,
-          lat:     r.lat     ?? null,
-          lng:     r.lng     ?? null,
-          watt:    r.watt    ?? null,
-          col:     r.col     ?? null,
-        };
-        del.run({ id: row.id });
-        insert.run(row);
+        const id = String(r.id).trim();
+        const existing = select.get(id);
+        const final = { 路燈編號: id };
+        for (const c of FULL_COLUMNS) {
+          if (c === "路燈編號") continue;
+          final[c] = existing ? (existing[c] ?? "") : "";
+        }
+        if (r._area) final["行政區"] = r._area;   // 有解析到行政區就更新
+        for (const [eng, zh] of Object.entries(basicMap)) {
+          const v = r[eng];
+          if (v !== undefined && v !== null && String(v).trim() !== "") final[zh] = String(v).trim();
+        }
+        del.run(final);
+        insert.run(final);
       }
     });
 
     importAll(mapped);
-    console.log(`[import] upsert ${mapped.length} 筆`);
+    console.log(`[import] upsert ${mapped.length} 筆 (lamps_full)`);
     res.json({ ok: true, count: mapped.length });
   } catch (e) {
     console.error("[import] 錯誤：", e);
