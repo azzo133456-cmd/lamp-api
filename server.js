@@ -13,34 +13,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ------------------------------------------------------
-// 資料庫路徑（Railway Volume 掛在 /app/data）
+// 主資料庫（Railway Volume 掛在 /app/data）
+// lamps.db 現只存放 tasks / site_visits / push_subscriptions；
+// 路燈資料已合併至 lamps_full。啟動時會移除殘留的舊 lamps 表以回收 Volume 空間。
+// （不再從 GitHub 下載 lamps.db；Volume 沒有時 better-sqlite3 會建立空檔並自動建表）
 // ------------------------------------------------------
-const DB_URL = "https://raw.githubusercontent.com/azzo133456-cmd/lamp-api/main/data/lamps.db";
 const LOCAL_DB = "/app/data/lamps.db";
-
-// 下載資料庫
-function downloadDB() {
-  return new Promise((resolve) => {
-    console.log("Downloading lamps.db from GitHub...");
-    const file = fs.createWriteStream(LOCAL_DB);
-    https.get(DB_URL, (res) => {
-      res.pipe(file);
-      file.on("finish", () => {
-        file.close(() => {
-          console.log("lamps.db downloaded.");
-          resolve();
-        });
-      });
-    });
-  });
-}
-
-// Volume 上沒有 db 才下載（首次部署）；之後直接用 Volume 上的版本
-if (!fs.existsSync(LOCAL_DB)) {
-  await downloadDB();
-} else {
-  console.log("lamps.db found in volume.");
-}
 
 // ------------------------------------------------------
 // 23 欄完整路燈清冊資料庫（lamps_full）
@@ -220,6 +198,19 @@ db.prepare(`
   )
 `).run();
 
+// 一次性清理：路燈資料已合併至 lamps_full，移除殘留的舊 lamps 表並回收空間
+// （tasks / site_visits / push_subscriptions 不受影響）
+try {
+  const hasLamps = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='lamps'").get();
+  if (hasLamps) {
+    db.exec("DROP TABLE lamps");
+    db.exec("VACUUM");
+    console.log("[cleanup] 已移除舊 lamps 表並 VACUUM 回收 Volume 空間");
+  }
+} catch (e) {
+  console.error("[cleanup] 移除 lamps 表失敗（不影響其他功能）：", e.message);
+}
+
 // ------------------------------------------------------
 // 取得單一路燈
 // ------------------------------------------------------
@@ -227,13 +218,10 @@ db.prepare(`
 // （中文欄 緯度/經度/瓦特數/色溫/詳細位置 → lat/lng/watt/col/address）
 // dbFull 未就緒或查無時，退回舊 lamps 表，確保地圖 app 不受影響
 function getLampBasic(id) {
-  if (dbFull) {
-    const r = dbFull.prepare(
-      'SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ?'
-    ).get(id);
-    if (r) return r;
-  }
-  return db.prepare("SELECT id, address, lat, lng, watt, col FROM lamps WHERE id = ?").get(id);
+  if (!dbFull) return null;
+  return dbFull.prepare(
+    'SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ?'
+  ).get(id);
 }
 
 app.get("/lamp/:id", (req, res) => {
@@ -286,9 +274,8 @@ app.get("/nearest", (req, res) => {
     return res.json({ error: "缺少經緯度參數" });
   }
 
-  const lamps = dbFull
-    ? dbFull.prepare('SELECT "路燈編號" AS id, "緯度" AS lat, "經度" AS lng FROM lamps_full').all()
-    : db.prepare("SELECT id, lat, lng FROM lamps").all();
+  if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
+  const lamps = dbFull.prepare('SELECT "路燈編號" AS id, "緯度" AS lat, "經度" AS lng FROM lamps_full').all();
 
   let nearest = null;
   let minDist = Infinity;
@@ -328,11 +315,9 @@ app.get("/tasks/:area", (req, res) => {
   // 非自訂點：批次向合併庫（lamps_full，退回舊 lamps）查座標/地址/瓦數/色溫，程式端 join
   const lampIds = tasks.filter(t => !t.is_custom).map(t => t.id);
   const lampMap = {};
-  if (lampIds.length) {
+  if (lampIds.length && dbFull) {
     const ph = lampIds.map(() => "?").join(",");
-    const list = dbFull
-      ? dbFull.prepare(`SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" IN (${ph})`).all(...lampIds)
-      : db.prepare(`SELECT id, address, lat, lng, watt, col FROM lamps WHERE id IN (${ph})`).all(...lampIds);
+    const list = dbFull.prepare(`SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" IN (${ph})`).all(...lampIds);
     for (const r of list) lampMap[r.id] = r;
   }
 
@@ -377,15 +362,15 @@ app.post("/tasks/:area", (req, res) => {
   const list = ids ?? (id ? [id] : []);
   if (!list.length) return res.status(400).json({ error: "缺少 id 或 ids" });
 
+  if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
   const insert = db.prepare("INSERT OR IGNORE INTO tasks (area, task_id) VALUES (?, ?)");
   const results = { ok: 0, notFound: [] };
 
-  const existsInFull = dbFull ? dbFull.prepare('SELECT 1 FROM lamps_full WHERE "路燈編號" = ?') : null;
-  const existsInLamps = db.prepare("SELECT 1 FROM lamps WHERE id = ?");
+  const existsInFull = dbFull.prepare('SELECT 1 FROM lamps_full WHERE "路燈編號" = ?');
   const run = db.transaction(() => {
     for (const lampId of list) {
       const key = lampId.trim();
-      const found = (existsInFull && existsInFull.get(key)) || existsInLamps.get(key);
+      const found = existsInFull.get(key);
       if (!found) { results.notFound.push(lampId); continue; }
       insert.run(req.params.area, key);
       results.ok++;
@@ -534,36 +519,20 @@ app.patch("/lamp/:id", (req, res) => {
   const { address, lat, lng, watt, col } = req.body;
 
   // 主庫為合併後的 lamps_full，編輯寫入中文欄位（只覆蓋有帶值的欄位）
-  if (dbFullWrite) {
-    const cur = dbFullWrite.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?').get(id);
-    if (cur) {
-      dbFullWrite.prepare(
-        'UPDATE lamps_full SET "詳細位置"=@address, "緯度"=@lat, "經度"=@lng, "瓦特數"=@watt, "色溫"=@col WHERE "路燈編號"=@id'
-      ).run({
-        id,
-        address: address !== undefined ? address    : cur["詳細位置"],
-        lat:     lat     !== undefined ? String(lat) : cur["緯度"],
-        lng:     lng     !== undefined ? String(lng) : cur["經度"],
-        watt:    watt    !== undefined ? String(watt): cur["瓦特數"],
-        col:     col     !== undefined ? String(col) : cur["色溫"],
-      });
-      console.log(`[edit] ${id} updated (lamps_full)`);
-      return res.json({ ok: true });
-    }
-  }
-
-  // 退路：dbFullWrite 未就緒或該編號只在舊表時，改寫舊 lamps
-  const lamp = db.prepare("SELECT * FROM lamps WHERE id = ?").get(id);
-  if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
-  db.prepare(`UPDATE lamps SET address=@address, lat=@lat, lng=@lng, watt=@watt, col=@col WHERE id=@id`).run({
+  if (!dbFullWrite) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
+  const cur = dbFullWrite.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?').get(id);
+  if (!cur) return res.status(404).json({ error: "查無此路燈編號" });
+  dbFullWrite.prepare(
+    'UPDATE lamps_full SET "詳細位置"=@address, "緯度"=@lat, "經度"=@lng, "瓦特數"=@watt, "色溫"=@col WHERE "路燈編號"=@id'
+  ).run({
     id,
-    address: address !== undefined ? address : lamp.address,
-    lat:     lat     !== undefined ? lat     : lamp.lat,
-    lng:     lng     !== undefined ? lng     : lamp.lng,
-    watt:    watt    !== undefined ? watt    : lamp.watt,
-    col:     col     !== undefined ? col     : lamp.col,
+    address: address !== undefined ? address    : cur["詳細位置"],
+    lat:     lat     !== undefined ? String(lat) : cur["緯度"],
+    lng:     lng     !== undefined ? String(lng) : cur["經度"],
+    watt:    watt    !== undefined ? String(watt): cur["瓦特數"],
+    col:     col     !== undefined ? String(col) : cur["色溫"],
   });
-  console.log(`[edit] ${id} updated (lamps fallback)`);
+  console.log(`[edit] ${id} updated (lamps_full)`);
   res.json({ ok: true });
 });
 
