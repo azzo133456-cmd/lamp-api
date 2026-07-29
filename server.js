@@ -119,9 +119,14 @@ try {
 // 回傳形狀對齊地圖 app 慣用的 id/address/lat/lng，並附上台北市特有欄位供前端顯示
 function getTaipeiLampBasic(key) {
   if (!dbFull) return null;
-  const row = dbFull.prepare(
-    'SELECT * FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ? LIMIT 1'
-  ).get(key, key);
+  let row;
+  try {
+    row = dbFull.prepare(
+      'SELECT * FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ? LIMIT 1'
+    ).get(key, key);
+  } catch (e) {
+    return null; // taipei_lamps 尚未匯入
+  }
   if (!row) return null;
   return {
     id: row["燈牌號碼"] || row["點位系統編號"],
@@ -361,9 +366,12 @@ app.get("/tasks/:area", (req, res) => {
     // 台北市：用「點位系統編號」或「燈牌號碼」比對回任務的 task_id
     if (lampIds.length && dbFull) {
       const ph = lampIds.map(() => "?").join(",");
-      const list = dbFull.prepare(
-        `SELECT * FROM taipei_lamps WHERE "點位系統編號" IN (${ph}) OR "燈牌號碼" IN (${ph})`
-      ).all(...lampIds, ...lampIds);
+      let list = [];
+      try {
+        list = dbFull.prepare(
+          `SELECT * FROM taipei_lamps WHERE "點位系統編號" IN (${ph}) OR "燈牌號碼" IN (${ph})`
+        ).all(...lampIds, ...lampIds);
+      } catch (e) { list = []; } // taipei_lamps 尚未匯入
       for (const r of list) {
         const mapped = {
           address: r["地點"], lat: r["緯度"], lng: r["經度"],
@@ -438,7 +446,12 @@ app.post("/tasks/:area", (req, res) => {
 
   if (isTaipei) {
     if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
-    const existsInTp = dbFull.prepare('SELECT 1 FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ?');
+    let existsInTp;
+    try {
+      existsInTp = dbFull.prepare('SELECT 1 FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ?');
+    } catch (e) {
+      return res.status(503).json({ error: "台北市資料尚未匯入，請稍後再試" });
+    }
     const run = db.transaction(() => {
       for (const lampId of list) {
         const key = String(lampId).trim();
@@ -879,6 +892,58 @@ app.post("/lamps-full/batch", (req, res) => {
   const not_found = ids.filter(id => !found.has(id));
 
   res.json({ count: rows.length, results: rows, not_found });
+});
+
+// ------------------------------------------------------
+// 📥 台北市路燈清冊整批匯入（taipei_lamps，與 lamps_full 共用同一個 db 檔案）
+// POST body: { rows: [...], reset: true/false }
+// reset=true（每次匯入的第一批）：清空重建；之後幾批 reset=false 只 append
+// 前端一次送太多筆容易逾時，可分批呼叫（例如每批 5000 筆）
+// ------------------------------------------------------
+const TAIPEI_COLUMNS = ["點位系統編號","緯度","經度","行政區","里","分隊","管區代碼","位置屬性","地點","材料名稱","attachedDate","燈牌號碼","標案別"];
+
+app.post("/taipei/import", (req, res) => {
+  if (!dbFullWrite) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
+
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const reset = !!req.body?.reset;
+  if (rows.length === 0 && !reset) return res.status(400).json({ error: "請提供 rows 陣列" });
+
+  try {
+    const colDefs = TAIPEI_COLUMNS.map(c => `"${c}" TEXT`).join(", ");
+    dbFullWrite.prepare(`CREATE TABLE IF NOT EXISTS taipei_lamps (${colDefs})`).run();
+
+    if (reset) {
+      dbFullWrite.exec("DELETE FROM taipei_lamps");
+    }
+
+    if (rows.length) {
+      const cols = TAIPEI_COLUMNS.map(c => `"${c}"`).join(", ");
+      const placeholders = TAIPEI_COLUMNS.map(c => `@${c}`).join(", ");
+      const insert = dbFullWrite.prepare(`INSERT INTO taipei_lamps (${cols}) VALUES (${placeholders})`);
+      const insertAll = dbFullWrite.transaction((list) => {
+        for (const raw of list) {
+          const row = {};
+          for (const col of TAIPEI_COLUMNS) {
+            const v = raw[col];
+            row[col] = (v === undefined || v === null) ? "" : String(v);
+          }
+          insert.run(row);
+        }
+      });
+      insertAll(rows);
+    }
+
+    dbFullWrite.prepare('CREATE INDEX IF NOT EXISTS idx_taipei_point ON taipei_lamps("點位系統編號")').run();
+    dbFullWrite.prepare('CREATE INDEX IF NOT EXISTS idx_taipei_tag ON taipei_lamps("燈牌號碼")').run();
+
+    const total = dbFullWrite.prepare("SELECT COUNT(*) c FROM taipei_lamps").get().c;
+    console.log(`[taipei/import] ${reset ? "重建並" : ""}匯入 ${rows.length} 筆，目前總筆數 ${total}`);
+    res.json({ ok: true, imported: rows.length, total });
+  } catch (e) {
+    console.error("[taipei/import] 錯誤：", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ------------------------------------------------------
