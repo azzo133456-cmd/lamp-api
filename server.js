@@ -116,19 +116,19 @@ try {
 // ------------------------------------------------------
 
 // 台北市路燈：因「燈牌號碼」尚未完整建置，查詢時同時比對「點位系統編號」與「燈牌號碼」
-// 回傳形狀對齊地圖 app 慣用的 id/address/lat/lng，並附上台北市特有欄位供前端顯示
-function getTaipeiLampBasic(key) {
-  if (!dbFull) return null;
-  let row;
+// 兩者都可能重複（燈牌號碼常見：舊點位刪除後號碼被新燈桿沿用、或各公園自行編號造成撞號），
+// 所以一次撈出所有符合的列，回傳陣列，交給呼叫端決定「唯一→直接顯示」或「多筆→列出讓使用者選」
+function getTaipeiLampCandidates(key) {
+  if (!dbFull) return [];
+  let rows;
   try {
-    row = dbFull.prepare(
-      'SELECT * FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ? LIMIT 1'
-    ).get(key, key);
+    rows = dbFull.prepare(
+      'SELECT * FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ?'
+    ).all(key, key);
   } catch (e) {
-    return null; // taipei_lamps 尚未匯入
+    return []; // taipei_lamps 尚未匯入
   }
-  if (!row) return null;
-  return {
+  return rows.map(row => ({
     id: row["燈牌號碼"] || row["點位系統編號"],
     point_id: row["點位系統編號"],
     tag_id: row["燈牌號碼"] || null,
@@ -141,7 +141,7 @@ function getTaipeiLampBasic(key) {
     zone_code: row["管區代碼"],
     loc_type: row["位置屬性"],
     pole_height: row["材料名稱"],
-  };
+  }));
 }
 
 // ------------------------------------------------------
@@ -264,9 +264,12 @@ app.get("/lamp/:id", (req, res) => {
   id = decodeURIComponent(id);
 
   // 台北市：獨立資料庫，欄位與桃園/新北不同（點位系統編號 / 燈牌號碼 查詢）
+  // 燈牌號碼可能重複（沿用舊號碼／不同公園各自編號撞號），有多筆符合時列出候選讓前端顯示選單
   if (req.query.area === "taipei") {
-    const lamp = getTaipeiLampBasic(id);
-    if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
+    const candidates = getTaipeiLampCandidates(id);
+    if (candidates.length === 0) return res.status(404).json({ error: "查無此路燈編號" });
+    if (candidates.length > 1) return res.json({ candidates });
+    const lamp = candidates[0];
     return res.json({
       ...lamp,
       nav: `https://www.google.com/maps/dir/?api=1&destination=${lamp.lat},${lamp.lng}`
