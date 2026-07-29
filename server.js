@@ -110,6 +110,36 @@ try {
 }
 
 // ------------------------------------------------------
+// 台北市路燈（taipei_lamps）：燈牌號碼尚未完整建置，主要以「點位系統編號」查詢
+// 與 lamps_full 共用同一個 db 檔案（同檔不同表），沿用 dbFull / dbFullWrite 連線，
+// 不另外開新檔案/新連線；隨 lamps_full.db 一起下載，不需要額外的下載步驟
+// ------------------------------------------------------
+
+// 台北市路燈：因「燈牌號碼」尚未完整建置，查詢時同時比對「點位系統編號」與「燈牌號碼」
+// 回傳形狀對齊地圖 app 慣用的 id/address/lat/lng，並附上台北市特有欄位供前端顯示
+function getTaipeiLampBasic(key) {
+  if (!dbFull) return null;
+  const row = dbFull.prepare(
+    'SELECT * FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ? LIMIT 1'
+  ).get(key, key);
+  if (!row) return null;
+  return {
+    id: row["燈牌號碼"] || row["點位系統編號"],
+    point_id: row["點位系統編號"],
+    tag_id: row["燈牌號碼"] || null,
+    address: row["地點"],
+    lat: row["緯度"],
+    lng: row["經度"],
+    district: row["行政區"],
+    village: row["里"],
+    squad: row["分隊"],
+    zone_code: row["管區代碼"],
+    loc_type: row["位置屬性"],
+    pole_height: row["材料名稱"],
+  };
+}
+
+// ------------------------------------------------------
 // 智控器總表（controllers）：controller_id / IMEI / IMSI 訊號資料
 // 因含敏感識別碼，不放公開 GitHub；改由 Railway Volume 持有，
 // 透過受 token 保護的 /admin/upload-controllers 端點一次性上傳。
@@ -228,6 +258,16 @@ app.get("/lamp/:id", (req, res) => {
   let id = req.params.id.trim();
   id = decodeURIComponent(id);
 
+  // 台北市：獨立資料庫，欄位與桃園/新北不同（點位系統編號 / 燈牌號碼 查詢）
+  if (req.query.area === "taipei") {
+    const lamp = getTaipeiLampBasic(id);
+    if (!lamp) return res.status(404).json({ error: "查無此路燈編號" });
+    return res.json({
+      ...lamp,
+      nav: `https://www.google.com/maps/dir/?api=1&destination=${lamp.lat},${lamp.lng}`
+    });
+  }
+
   const lamp = getLampBasic(id);
 
   if (!lamp) {
@@ -305,6 +345,8 @@ app.get("/nearest", (req, res) => {
 
 // 取得某區任務清單（優先置頂）
 app.get("/tasks/:area", (req, res) => {
+  const isTaipei = req.params.area === "taipei";
+
   const tasks = db.prepare(`
     SELECT task_id AS id, is_custom, label, added_at, priority, color, lat, lng
     FROM tasks
@@ -312,10 +354,28 @@ app.get("/tasks/:area", (req, res) => {
     ORDER BY priority DESC, added_at DESC
   `).all(req.params.area);
 
-  // 非自訂點：批次向合併庫（lamps_full，退回舊 lamps）查座標/地址/瓦數/色溫，程式端 join
   const lampIds = tasks.filter(t => !t.is_custom).map(t => t.id);
   const lampMap = {};
-  if (lampIds.length && dbFull) {
+
+  if (isTaipei) {
+    // 台北市：用「點位系統編號」或「燈牌號碼」比對回任務的 task_id
+    if (lampIds.length && dbFull) {
+      const ph = lampIds.map(() => "?").join(",");
+      const list = dbFull.prepare(
+        `SELECT * FROM taipei_lamps WHERE "點位系統編號" IN (${ph}) OR "燈牌號碼" IN (${ph})`
+      ).all(...lampIds, ...lampIds);
+      for (const r of list) {
+        const mapped = {
+          address: r["地點"], lat: r["緯度"], lng: r["經度"],
+          district: r["行政區"], village: r["里"], squad: r["分隊"],
+          zone_code: r["管區代碼"], loc_type: r["位置屬性"], pole_height: r["材料名稱"],
+        };
+        if (r["點位系統編號"]) lampMap[r["點位系統編號"]] = mapped;
+        if (r["燈牌號碼"]) lampMap[r["燈牌號碼"]] = mapped;
+      }
+    }
+  } else if (lampIds.length && dbFull) {
+    // 非自訂點：批次向合併庫（lamps_full，退回舊 lamps）查座標/地址/瓦數/色溫，程式端 join
     const ph = lampIds.map(() => "?").join(",");
     const list = dbFull.prepare(`SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" IN (${ph})`).all(...lampIds);
     for (const r of list) lampMap[r.id] = r;
@@ -323,15 +383,25 @@ app.get("/tasks/:area", (req, res) => {
 
   const rows = tasks.map(t => {
     const l = t.is_custom ? null : lampMap[t.id];
-    return {
+    const base = {
       id: t.id, is_custom: t.is_custom, label: t.label,
       added_at: t.added_at, priority: t.priority, color: t.color,
       lat: t.lat ?? (l ? l.lat : null),
       lng: t.lng ?? (l ? l.lng : null),
       address: t.label ?? (l ? l.address : null),
-      watt: l ? l.watt : null,
-      col: l ? l.col : null,
     };
+    if (isTaipei) {
+      return {
+        ...base,
+        district: l ? l.district : null,
+        village: l ? l.village : null,
+        squad: l ? l.squad : null,
+        zone_code: l ? l.zone_code : null,
+        loc_type: l ? l.loc_type : null,
+        pole_height: l ? l.pole_height : null,
+      };
+    }
+    return { ...base, watt: l ? l.watt : null, col: l ? l.col : null };
   });
   res.json(rows);
 });
@@ -362,10 +432,27 @@ app.post("/tasks/:area", (req, res) => {
   const list = ids ?? (id ? [id] : []);
   if (!list.length) return res.status(400).json({ error: "缺少 id 或 ids" });
 
-  if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
+  const isTaipei = req.params.area === "taipei";
   const insert = db.prepare("INSERT OR IGNORE INTO tasks (area, task_id) VALUES (?, ?)");
   const results = { ok: 0, notFound: [] };
 
+  if (isTaipei) {
+    if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
+    const existsInTp = dbFull.prepare('SELECT 1 FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ?');
+    const run = db.transaction(() => {
+      for (const lampId of list) {
+        const key = String(lampId).trim();
+        const found = existsInTp.get(key, key);
+        if (!found) { results.notFound.push(lampId); continue; }
+        insert.run(req.params.area, key);
+        results.ok++;
+      }
+    });
+    run();
+    return res.json({ ok: true, added: results.ok, notFound: results.notFound });
+  }
+
+  if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
   const existsInFull = dbFull.prepare('SELECT 1 FROM lamps_full WHERE "路燈編號" = ?');
   const run = db.transaction(() => {
     for (const lampId of list) {
