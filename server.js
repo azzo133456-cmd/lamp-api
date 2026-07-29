@@ -366,23 +366,24 @@ app.get("/tasks/:area", (req, res) => {
   const lampMap = {};
 
   if (isTaipei) {
-    // 台北市：用「點位系統編號」或「燈牌號碼」比對回任務的 task_id
+    // 台北市：task_id 一律是「點位系統編號」（新增時已解析過，見 POST /tasks/:area），
+    // 只用點位系統編號比對，不再比對燈牌號碼——避免燈牌號碼重複時（見下方新增邏輯的說明）
+    // 兩筆不同地點的路燈互相蓋掉彼此的座標
     if (lampIds.length && dbFull) {
       const ph = lampIds.map(() => "?").join(",");
       let list = [];
       try {
         list = dbFull.prepare(
-          `SELECT * FROM taipei_lamps WHERE "點位系統編號" IN (${ph}) OR "燈牌號碼" IN (${ph})`
-        ).all(...lampIds, ...lampIds);
+          `SELECT * FROM taipei_lamps WHERE "點位系統編號" IN (${ph})`
+        ).all(...lampIds);
       } catch (e) { list = []; } // taipei_lamps 尚未匯入
       for (const r of list) {
-        const mapped = {
+        lampMap[r["點位系統編號"]] = {
           address: r["地點"], lat: r["緯度"], lng: r["經度"],
           district: r["行政區"], village: r["里"], squad: r["分隊"],
           zone_code: r["管區代碼"], loc_type: r["位置屬性"], pole_height: r["材料名稱"],
+          tag_id: r["燈牌號碼"] || null,
         };
-        if (r["點位系統編號"]) lampMap[r["點位系統編號"]] = mapped;
-        if (r["燈牌號碼"]) lampMap[r["燈牌號碼"]] = mapped;
       }
     }
   } else if (lampIds.length && dbFull) {
@@ -404,6 +405,8 @@ app.get("/tasks/:area", (req, res) => {
     if (isTaipei) {
       return {
         ...base,
+        point_id: t.id,               // task_id 一律是點位系統編號
+        tag_id: l ? l.tag_id : null,  // 燈牌號碼（可能還沒建置）
         district: l ? l.district : null,
         village: l ? l.village : null,
         squad: l ? l.squad : null,
@@ -449,23 +452,22 @@ app.post("/tasks/:area", (req, res) => {
 
   if (isTaipei) {
     if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
-    let existsInTp;
-    try {
-      existsInTp = dbFull.prepare('SELECT 1 FROM taipei_lamps WHERE "點位系統編號" = ? OR "燈牌號碼" = ?');
-    } catch (e) {
-      return res.status(503).json({ error: "台北市資料尚未匯入，請稍後再試" });
-    }
+    // task_id 一律存「點位系統編號」（唯一），輸入可以是點位系統編號或燈牌號碼；
+    // 燈牌號碼偶爾重複（舊點位刪除後號碼被沿用、不同公園各自編號撞號），
+    // 撞到多筆就不自動選，回報在 ambiguous 讓使用者改用搜尋框挑選要加的那一筆
+    const ambiguous = []; // [{ key, count }]
     const run = db.transaction(() => {
       for (const lampId of list) {
         const key = String(lampId).trim();
-        const found = existsInTp.get(key, key);
-        if (!found) { results.notFound.push(lampId); continue; }
-        insert.run(req.params.area, key);
+        const candidates = getTaipeiLampCandidates(key);
+        if (candidates.length === 0) { results.notFound.push(lampId); continue; }
+        if (candidates.length > 1) { ambiguous.push({ key: lampId, count: candidates.length }); continue; }
+        insert.run(req.params.area, candidates[0].point_id);
         results.ok++;
       }
     });
     run();
-    return res.json({ ok: true, added: results.ok, notFound: results.notFound });
+    return res.json({ ok: true, added: results.ok, notFound: results.notFound, ambiguous });
   }
 
   if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
