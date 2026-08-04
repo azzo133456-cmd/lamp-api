@@ -1068,17 +1068,60 @@ app.post("/controllers/batch", (req, res) => {
 // 前端直接上傳 .md 原始文字；以總表為準，全量取代
 // body：text/plain（Markdown 表格內容）
 // ------------------------------------------------------
+// 支援兩種常見的智控總表 MD 表格樣式：
+//   1) 標準 Markdown pipe 表格： | ID | controller_id |
+//   2) tableConvert.com 的無 pipe 純文字表格（欄名/資料各佔一行，中間用 --- 分隔）
+// 兩者都可能只有 controller_id 單一欄（此時 ID 直接沿用 controller_id）。
 function parseControllersMd(text) {
+  const lines = String(text).split(/\r?\n/);
+  const hasPipe = lines.some(l => l.trim().startsWith("|"));
   const rows = [];
-  for (const line of String(text).split(/\r?\n/)) {
-    const t = line.trim();
-    if (!t.startsWith("|")) continue;
-    if (t.includes("controller_id") || /^\|[\s-]*\|/.test(t)) continue; // 標題/分隔列
-    const cells = t.split("|").slice(1, -1).map(c => c.trim());
-    if (cells.length < 2) continue;
-    const [id, cid] = cells;
-    if (!cid) continue;
-    rows.push({ id, cid });
+
+  const pickIdCid = (headerCols, cells) => {
+    const idIdx = headerCols.indexOf("id");
+    const cidIdx = headerCols.findIndex(c => c.includes("controller_id"));
+    if (cidIdx === -1) return null;
+    const cid = (cells[cidIdx] || "").trim();
+    if (!cid) return null;
+    const id = idIdx !== -1 ? (cells[idIdx] || "").trim() : cid;
+    return { id, cid };
+  };
+
+  if (hasPipe) {
+    let headerCols = null;
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("|")) continue;
+      if (/^\|[\s-]*\|/.test(t)) continue; // 分隔列 |---|---|
+      const cells = t.split("|").slice(1, -1).map(c => c.trim());
+      if (!headerCols) {
+        if (!cells.some(c => /controller_id/i.test(c))) continue; // 還沒找到標題列
+        headerCols = cells.map(c => c.toLowerCase());
+        continue;
+      }
+      const r = pickIdCid(headerCols, cells);
+      if (r) rows.push(r);
+    }
+  } else {
+    let headerCols = null;
+    for (const raw of lines) {
+      const t = raw.trim();
+      if (!t) continue;
+      if (/^-{3,}$/.test(t)) continue; // 分隔列 ---
+      if (!headerCols) {
+        headerCols = t.split(/\s{2,}|\t/).map(c => c.trim().toLowerCase()).filter(Boolean);
+        continue;
+      }
+      if (headerCols.length <= 1) {
+        if (headerCols[0] && !headerCols[0].includes("controller_id")) continue;
+        if (!t) continue;
+        rows.push({ id: t, cid: t });
+        continue;
+      }
+      const cells = t.split(/\s{2,}|\t/).map(c => c.trim()).filter(Boolean);
+      const r = pickIdCid(headerCols, cells);
+      if (r) rows.push(r);
+    }
   }
   return rows;
 }
