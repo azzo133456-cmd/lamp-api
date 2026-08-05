@@ -252,12 +252,27 @@ try {
 // 從合併後的 lamps_full 讀單筆，對應回地圖 app 慣用的英文欄位
 // （中文欄 緯度/經度/瓦特數/色溫/詳細位置 → lat/lng/watt/col/address）
 // dbFull 未就緒或查無時，退回舊 lamps 表，確保地圖 app 不受影響
-function getLampBasic(id) {
+// districts 有帶時，只在該縣市的行政區內找，避免路燈/開關箱編號跨縣市撞號查錯筆
+function getLampBasic(id, districts) {
   if (!dbFull) return null;
+  if (districts && districts.length) {
+    const ph = districts.map(() => "?").join(",");
+    return dbFull.prepare(
+      `SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ? AND "行政區" IN (${ph})`
+    ).get(id, ...districts);
+  }
   return dbFull.prepare(
     'SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ?'
   ).get(id);
 }
+
+// 桃園/楊梅/蘆竹 vs 新北 部分行政區編號會重複（例如開關箱編號），
+// 依地圖頁面的 mode 限定查詢範圍，避免撞號查到另一個縣市的資料
+const MODE_DISTRICTS = {
+  luzhu:   ["桃園區", "楊梅區", "蘆竹區", "觀音區"],
+  yangmei: ["桃園區", "楊梅區", "蘆竹區", "觀音區"],
+  xinbei:  ["三重區", "五股區", "汐止區", "深坑區", "石碇區"],
+};
 
 app.get("/lamp/:id", (req, res) => {
   let id = req.params.id.trim();
@@ -276,7 +291,7 @@ app.get("/lamp/:id", (req, res) => {
     });
   }
 
-  const lamp = getLampBasic(id);
+  const lamp = getLampBasic(id, MODE_DISTRICTS[req.query.mode]);
 
   if (!lamp) {
     return res.status(404).json({ error: "查無此路燈編號" });
