@@ -790,10 +790,17 @@ app.post("/import", (req, res) => {
     const insert = writer.prepare(`INSERT INTO lamps_full (${cols}) VALUES (${ph})`);
     const basicMap = { address: "詳細位置", lat: "緯度", lng: "經度", watt: "瓦特數", col: "色溫" };
 
+    // 同編號但行政區不同 → 判定為跨縣市/跨區撞號，直接跳過不覆蓋
+    // （避免像楊梅/蘆竹的開關箱編號被新北市同號資料蓋掉的狀況再發生）
+    const conflicts = [];
     const importAll = writer.transaction((rows) => {
       for (const r of rows) {
         const id = String(r.id).trim();
         const existing = select.get(id);
+        if (existing && existing["行政區"] && r._area && existing["行政區"] !== r._area) {
+          conflicts.push({ id, existing_area: existing["行政區"], incoming_area: r._area });
+          continue;
+        }
         const final = { 路燈編號: id };
         for (const c of FULL_COLUMNS) {
           if (c === "路燈編號") continue;
@@ -810,8 +817,9 @@ app.post("/import", (req, res) => {
     });
 
     importAll(mapped);
-    console.log(`[import] upsert ${mapped.length} 筆 (lamps_full)`);
-    res.json({ ok: true, count: mapped.length });
+    const imported = mapped.length - conflicts.length;
+    console.log(`[import] upsert ${imported} 筆、跳過撞號 ${conflicts.length} 筆 (lamps_full)`);
+    res.json({ ok: true, count: imported, conflicts });
   } catch (e) {
     console.error("[import] 錯誤：", e);
     res.status(500).json({ error: e.message });
