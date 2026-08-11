@@ -271,6 +271,7 @@ function getLampBasic(id, districts) {
 const MODE_DISTRICTS = {
   luzhu:   ["桃園區", "楊梅區", "蘆竹區", "觀音區"],
   yangmei: ["桃園區", "楊梅區", "蘆竹區", "觀音區"],
+  paiwai:  ["桃園區", "楊梅區", "蘆竹區", "觀音區"],
   xinbei:  ["三重區", "五股區", "汐止區", "深坑區", "石碇區"],
 };
 
