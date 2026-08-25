@@ -216,10 +216,17 @@ db.prepare(`
     visit_date  TEXT NOT NULL,
     visit_time  TEXT,
     note        TEXT,
+    lat         TEXT,
+    lng         TEXT,
     notified    INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now','localtime'))
   )
 `).run();
+
+// migration：舊版 site_visits 補座標欄位（定位一次後寫回，之後不必重打 Geocoding）
+const visitCols = db.prepare("PRAGMA table_info(site_visits)").all().map(c => c.name);
+if (!visitCols.includes("lat")) db.prepare("ALTER TABLE site_visits ADD COLUMN lat TEXT").run();
+if (!visitCols.includes("lng")) db.prepare("ALTER TABLE site_visits ADD COLUMN lng TEXT").run();
 
 // push_subscriptions 資料表（Web Push 訂閱資訊）
 db.prepare(`
@@ -1334,7 +1341,7 @@ app.get("/visits/:area", (req, res) => {
   `).run(req.params.area, today);
 
   const rows = db.prepare(`
-    SELECT id, area, label, visit_date, visit_time, note, notified, created_at
+    SELECT id, area, label, visit_date, visit_time, note, lat, lng, notified, created_at
     FROM site_visits
     WHERE area = ?
     ORDER BY visit_date ASC, visit_time ASC
@@ -1353,6 +1360,15 @@ app.post("/visits/:area", (req, res) => {
   `).run(req.params.area, label, visit_date, visit_time || null, note || null);
 
   res.json({ ok: true, id: result.lastInsertRowid });
+});
+
+// 記住會勘地點的座標（前端定位成功後寫回，避免每次都重打 Geocoding API）
+app.patch("/visits/:area/:id/coords", (req, res) => {
+  const { lat, lng } = req.body ?? {};
+  if (lat == null || lng == null) return res.status(400).json({ error: "缺少 lat / lng" });
+  db.prepare("UPDATE site_visits SET lat = ?, lng = ? WHERE area = ? AND id = ?")
+    .run(String(lat), String(lng), req.params.area, req.params.id);
+  res.json({ ok: true });
 });
 
 // 刪除會勘排程
@@ -1402,8 +1418,9 @@ app.post("/push/unsubscribe", (req, res) => {
 
 // 發送推播給某區所有訂閱者
 async function sendPushToArea(area, payload) {
-  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return 0;
   const subs = db.prepare("SELECT * FROM push_subscriptions WHERE area = ?").all(area);
+  let sent = 0;
   for (const sub of subs) {
     const pushSub = {
       endpoint: sub.endpoint,
@@ -1411,6 +1428,7 @@ async function sendPushToArea(area, payload) {
     };
     try {
       await webpush.sendNotification(pushSub, JSON.stringify(payload));
+      sent++;
     } catch (e) {
       if (e.statusCode === 404 || e.statusCode === 410) {
         db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(sub.endpoint);
@@ -1419,32 +1437,56 @@ async function sendPushToArea(area, payload) {
       }
     }
   }
+  return sent;
 }
 
 // ------------------------------------------------------
-// ⏰ 排程任務：每天下午 4 點檢查「明天」的會勘並推播
+// ⏰ 排程任務：每 4 小時檢查「未來 24 小時內」的會勘並推播
 // ------------------------------------------------------
 async function checkAndNotifyVisits() {
-  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
-  const tomorrowStr = taiwanDateTime(tomorrow).date; // YYYY-MM-DD
+  const now  = new Date();
+  const { date: today, time: nowTime } = taiwanDateTime(now);
+  const { date: tomorrow } = taiwanDateTime(new Date(now.getTime() + 24 * 60 * 60 * 1000));
 
+  // 24 小時的視窗最多只會跨到明天，所以只撈這兩天
   const rows = db.prepare(`
-    SELECT * FROM site_visits WHERE visit_date = ? AND notified = 0
-  `).all(tomorrowStr);
+    SELECT * FROM site_visits
+    WHERE notified = 0 AND visit_date IN (?, ?)
+  `).all(today, tomorrow);
 
+  let notified = 0;
   for (const v of rows) {
-    await sendPushToArea(v.area, {
-      title: "明天有會勘排程",
-      body: `${v.label}${v.visit_time ? `　${v.visit_time}` : ""}${v.note ? `\n${v.note}` : ""}`,
+    // 沒填時間的當作當天上午 9 點，才能判斷是否落在 24 小時內
+    const t = v.visit_time || "09:00";
+    const startMin = (v.visit_date === today ? 0 : 24 * 60)
+      + Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+    const nowMin = Number(nowTime.slice(0, 2)) * 60 + Number(nowTime.slice(3, 5));
+    const diff = startMin - nowMin;
+
+    if (diff < 0 || diff > 24 * 60) continue;   // 已經過了、或還太遠
+
+    const when = v.visit_date === today ? "今天" : "明天";
+    const sent = await sendPushToArea(v.area, {
+      title: `${when}有會勘排程`,
+      body: `${v.label}${v.visit_time ? `　${v.visit_time}` : ""}${v.note ? `
+${v.note}` : ""}`,
       tag: `visit-${v.id}`
     });
-    db.prepare("UPDATE site_visits SET notified = 1 WHERE id = ?").run(v.id);
+
+    // 一筆都沒推成功就不標記，留待下一輪重試（VAPID 沒設、訂閱暫時失效等）
+    if (sent > 0) {
+      db.prepare("UPDATE site_visits SET notified = 1 WHERE id = ?").run(v.id);
+      notified++;
+    } else {
+      console.warn(`[visits] id=${v.id} 無成功推播，保留 notified=0 下輪重試`);
+    }
   }
-  if (rows.length) console.log(`[visits] 推播 ${rows.length} 筆明日會勘`);
+  if (notified) console.log(`[visits] 推播 ${notified} 筆 24 小時內的會勘`);
 }
 
-// 每天下午 4:00（台灣時間）檢查一次
-cron.schedule("0 16 * * *", () => {
+// 每 4 小時檢查一次（0、4、8、12、16、20 點，台灣時間）
+// 原本只在 16:00 跑且只查「明天」，下午才新增的隔日會勘會整筆漏推
+cron.schedule("0 */4 * * *", () => {
   checkAndNotifyVisits().catch(e => console.error("[visits] 推播檢查失敗：", e.message));
 }, { timezone: "Asia/Taipei" });
 
