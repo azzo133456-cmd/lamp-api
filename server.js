@@ -591,69 +591,6 @@ app.get("/geocode", async (req, res) => {
 });
 
 // ------------------------------------------------------
-// 🔤 地址輸入建議（Places Autocomplete New，後端轉發避免 key 外露）
-// 計價：session 未以 Place Details 收尾 → 走 per-request（每月 10,000 次免費）
-// 前端已做 debounce 與「含中文才查」的過濾，正常用量不會超過免費額度
-// ------------------------------------------------------
-app.get("/places/autocomplete", (req, res) => {
-  const input = (req.query.q || "").trim();
-  if (!input) return res.status(400).json({ error: "缺少 q 參數" });
-
-  const key = process.env.GOOGLE_MAPS_KEY;
-  if (!key) return res.status(503).json({ error: "未設定 GOOGLE_MAPS_KEY" });
-
-  const body = {
-    input,
-    languageCode: "zh-TW",
-    regionCode: "TW",
-    includedRegionCodes: ["tw"],
-  };
-  // 有帶目前地圖中心 → 加權在地結果（不是硬篩，只是排序偏好）
-  const lat = Number(req.query.lat), lng = Number(req.query.lng);
-  if (Number.isFinite(lat) && Number.isFinite(lng)) {
-    body.locationBias = { circle: { center: { latitude: lat, longitude: lng }, radius: 30000 } };
-  }
-
-  const payload = JSON.stringify(body);
-  const r = https.request(
-    "https://places.googleapis.com/v1/places:autocomplete",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(payload),
-        "X-Goog-Api-Key": key,
-      },
-    },
-    (r2) => {
-      let data = "";
-      r2.on("data", c => data += c);
-      r2.on("end", () => {
-        try {
-          const json = JSON.parse(data);
-          if (json.error) {
-            console.error("[places] ", json.error.status, json.error.message);
-            return res.status(502).json({ error: json.error.message || "Places API 錯誤" });
-          }
-          const suggestions = (json.suggestions || [])
-            .map(s => s.placePrediction)
-            .filter(Boolean)
-            .map(p => ({ text: p.text?.text || "", placeId: p.placeId }))
-            .filter(s => s.text);
-          res.json({ suggestions });
-        } catch (e) {
-          console.error("[places] parse error", e);
-          res.status(500).json({ error: "解析失敗" });
-        }
-      });
-    }
-  );
-  r.on("error", () => res.status(500).json({ error: "連線失敗" }));
-  r.write(payload);
-  r.end();
-});
-
-// ------------------------------------------------------
 // 📷 截圖文字辨識（Google Cloud Vision OCR，後端轉發避免 key 外露）
 // body: { image: "<base64>" }（不含 data:image/...;base64, 前綴）
 // ------------------------------------------------------
