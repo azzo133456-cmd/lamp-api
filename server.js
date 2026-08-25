@@ -502,9 +502,11 @@ app.post("/tasks/:area", (req, res) => {
 });
 
 // 地址定位（Google Maps Geocoding API）
-function geocode(address) {
+// Google Geocoding：主要來源（需 GOOGLE_MAPS_KEY 且該專案已開通計費）
+function geocodeGoogle(address) {
   return new Promise((resolve) => {
     const key = process.env.GOOGLE_MAPS_KEY;
+    if (!key) return resolve({ _error: "NO_KEY", _msg: "未設定 GOOGLE_MAPS_KEY" });
     const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&language=zh-TW&region=TW&key=${key}`;
     https.get(url, (r) => {
       let data = "";
@@ -523,6 +525,37 @@ function geocode(address) {
       });
     }).on("error", () => resolve(null));
   });
+}
+
+// OpenStreetMap Nominatim：備援來源（免金鑰）
+// Google 金鑰失效／未開通計費時仍能定位中文地址，避免「地址定位也失敗」
+function geocodeNominatim(address) {
+  return new Promise((resolve) => {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=tw&accept-language=zh-TW&q=${encodeURIComponent(address)}`;
+    https.get(url, { headers: { "User-Agent": "lamp-api/1.0 (azzo133456@gmail.com)" } }, (r) => {
+      let data = "";
+      r.on("data", c => data += c);
+      r.on("end", () => {
+        try {
+          const arr = JSON.parse(data);
+          if (Array.isArray(arr) && arr[0]) {
+            resolve({ lat: Number(arr[0].lat), lng: Number(arr[0].lon), source: "osm" });
+          } else {
+            resolve(null);
+          }
+        } catch (e) { console.error("[geocode] nominatim parse error", e); resolve(null); }
+      });
+    }).on("error", () => resolve(null));
+  });
+}
+
+// 先問 Google，失敗（含 REQUEST_DENIED／OVER_QUERY_LIMIT）再退回 Nominatim
+async function geocode(address) {
+  const g = await geocodeGoogle(address);
+  if (g && g.lat != null) return g;
+  const n = await geocodeNominatim(address);
+  if (n) return n;
+  return g;
 }
 
 // 行車路線（Google Directions API，後端轉發避免 key 外露）
@@ -553,7 +586,7 @@ app.get("/geocode", async (req, res) => {
   if (!q) return res.status(400).json({ error: "缺少 q 參數" });
   const coords = await geocode(q);
   if (!coords) return res.status(404).json({ error: "找不到此地址" });
-  if (coords._error) return res.status(502).json({ error: `Google Maps 錯誤：${coords._error}`, detail: coords._msg });
+  if (coords.lat == null) return res.status(502).json({ error: `地址定位失敗（Google：${coords._error}，備援 OSM 也查無結果）`, detail: coords._msg });
   res.json(coords);
 });
 
@@ -606,7 +639,7 @@ app.post("/tasks/:area/custom", async (req, res) => {
   // 沒有經緯度 → 用地址定位
   if (!lat || !lng) {
     const coords = await geocode(label);
-    if (!coords) return res.status(400).json({ error: "地址定位失敗，請手動輸入經緯度" });
+    if (!coords || coords.lat == null) return res.status(400).json({ error: "地址定位失敗，請手動輸入經緯度" });
     lat = coords.lat;
     lng = coords.lng;
   }
