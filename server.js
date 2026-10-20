@@ -175,6 +175,7 @@ openControllersDB();
 const app = express();
 app.use(compression());   // gzip 壓縮回應（對 /tasks 大量 JSON 效果最明顯）
 app.use(cors());
+app.set("trust proxy", true);   // Render 在反向代理後面，req.ip 才會是使用者的真實 IP
 app.use(express.json({ limit: "50mb" }));
 
 // 正確定位 lamps.db
@@ -206,6 +207,29 @@ if (!taskCols.includes("color"))     db.prepare("ALTER TABLE tasks ADD COLUMN co
 if (taskCols.includes("lamp_id") && !taskCols.includes("task_id")) {
   db.prepare("ALTER TABLE tasks RENAME COLUMN lamp_id TO task_id").run();
 }
+
+// tasks_trash：刪除的任務先搬到這裡（誤按清空時可還原，也能查是哪台裝置刪的）
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS tasks_trash (
+    trash_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    TEXT NOT NULL,
+    area        TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
+    is_custom   INTEGER,
+    label       TEXT,
+    lat         TEXT,
+    lng         TEXT,
+    priority    INTEGER,
+    color       TEXT,
+    added_at    TEXT,
+    deleted_at  TEXT DEFAULT (datetime('now','localtime')),
+    client_ip   TEXT,
+    user_agent  TEXT
+  )
+`).run();
+db.prepare("CREATE INDEX IF NOT EXISTS idx_trash_batch ON tasks_trash(batch_id)").run();
+// 回收桶只留 30 天
+db.prepare("DELETE FROM tasks_trash WHERE deleted_at < datetime('now','localtime','-30 days')").run();
 
 // site_visits 資料表（會勘排程：日期+時間+地點+備註，與路燈無關）
 db.prepare(`
@@ -660,16 +684,72 @@ app.post("/tasks/:area/custom", async (req, res) => {
 });
 
 // 從任務清單移除（單筆）
+// 刪除前先把資料搬進 tasks_trash，同一次刪除共用一個 batch_id，可整批還原
+const moveToTrash = db.transaction((rows, batchId, ip, ua) => {
+  const ins = db.prepare(`
+    INSERT INTO tasks_trash (batch_id, area, task_id, is_custom, label, lat, lng, priority, color, added_at, client_ip, user_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const del = db.prepare("DELETE FROM tasks WHERE area = ? AND task_id = ?");
+  for (const r of rows) {
+    ins.run(batchId, r.area, r.task_id, r.is_custom, r.label, r.lat, r.lng, r.priority, r.color, r.added_at, ip, ua);
+    del.run(r.area, r.task_id);
+  }
+});
+
+function trashAndDelete(req, rows, kind) {
+  const batchId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const ip = req.ip || "";
+  const ua = (req.get("user-agent") || "").slice(0, 300);
+  moveToTrash(rows, batchId, ip, ua);
+  console.log(`[tasks] ${kind} area=${req.params.area} 筆數=${rows.length} batch=${batchId} ip=${ip} ua=${ua}`);
+  return batchId;
+}
+
 app.delete("/tasks/:area/:id", (req, res) => {
-  db.prepare("DELETE FROM tasks WHERE area = ? AND task_id = ?")
-    .run(req.params.area, decodeURIComponent(req.params.id));
-  res.json({ ok: true });
+  const rows = db.prepare("SELECT * FROM tasks WHERE area = ? AND task_id = ?")
+    .all(req.params.area, decodeURIComponent(req.params.id));
+  const batch = rows.length ? trashAndDelete(req, rows, "單筆刪除") : null;
+  res.json({ ok: true, batch, count: rows.length });
 });
 
 // 清空整個區域的任務清單
 app.delete("/tasks/:area", (req, res) => {
-  db.prepare("DELETE FROM tasks WHERE area = ?").run(req.params.area);
-  res.json({ ok: true });
+  const rows = db.prepare("SELECT * FROM tasks WHERE area = ?").all(req.params.area);
+  const batch = rows.length ? trashAndDelete(req, rows, "清空") : null;
+  res.json({ ok: true, batch, count: rows.length });
+});
+
+// 還原整批刪除（已存在同編號的任務不覆蓋）
+app.post("/tasks/:area/restore", (req, res) => {
+  const { batch } = req.body ?? {};
+  if (!batch) return res.status(400).json({ error: "缺少 batch" });
+  const rows = db.prepare("SELECT * FROM tasks_trash WHERE area = ? AND batch_id = ?").all(req.params.area, batch);
+  if (!rows.length) return res.status(404).json({ error: "找不到這批刪除紀錄（可能已超過 30 天）" });
+
+  const restore = db.transaction(() => {
+    const ins = db.prepare(`
+      INSERT OR IGNORE INTO tasks (area, task_id, is_custom, label, lat, lng, priority, color, added_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    let n = 0;
+    for (const r of rows) n += ins.run(r.area, r.task_id, r.is_custom, r.label, r.lat, r.lng, r.priority, r.color, r.added_at).changes;
+    db.prepare("DELETE FROM tasks_trash WHERE area = ? AND batch_id = ?").run(req.params.area, batch);
+    return n;
+  });
+  const restored = restore();
+  console.log(`[tasks] 還原 area=${req.params.area} batch=${batch} 還原=${restored}/${rows.length}`);
+  res.json({ ok: true, restored, total: rows.length });
+});
+
+// 查某區的刪除紀錄（依批次彙總：何時、幾筆、哪台裝置）
+app.get("/trash/:area", (req, res) => {
+  const rows = db.prepare(`
+    SELECT batch_id, MIN(deleted_at) AS deleted_at, COUNT(*) AS count, client_ip, user_agent
+    FROM tasks_trash WHERE area = ?
+    GROUP BY batch_id ORDER BY deleted_at DESC
+  `).all(req.params.area);
+  res.json(rows);
 });
 
 // ------------------------------------------------------
