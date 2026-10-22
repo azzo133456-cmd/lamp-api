@@ -68,6 +68,15 @@ try {
   dbFullWrite = null;
 }
 
+// 燈具編號索引（/lamps-full/batch 掃標籤 QR 用）；建不起來只會變慢，不影響查詢結果
+if (dbFullWrite) {
+  try {
+    dbFullWrite.prepare('CREATE INDEX IF NOT EXISTS idx_lamps_full_lampid ON lamps_full("燈具編號")').run();
+  } catch (e) {
+    console.error("lamps_full 燈具編號索引建立失敗（查詢仍可用但較慢）：", e.message);
+  }
+}
+
 // ------------------------------------------------------
 // 路燈開關箱資料庫（switchboxes）：開關箱編號 / 位置 / 座標 等 10 欄
 // 獨立檔案、獨立連線，比照 lamps_full；首次部署自 GitHub 下載，之後用 Volume 版本
@@ -1034,10 +1043,13 @@ app.post("/lamps-full/batch", (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).map(s => s.trim()).filter(Boolean) : [];
   if (ids.length === 0) return res.status(400).json({ error: "請提供 ids 陣列" });
 
+  // 路燈編號（0400001）或燈具編號（標籤 QR 的 LI02_…）都能查
   const placeholders = ids.map(() => "?").join(",");
-  const rows = dbFull.prepare(`SELECT * FROM lamps_full WHERE "路燈編號" IN (${placeholders})`).all(...ids);
+  const rows = dbFull.prepare(
+    `SELECT * FROM lamps_full WHERE "路燈編號" IN (${placeholders}) OR "燈具編號" IN (${placeholders})`
+  ).all(...ids, ...ids);
 
-  const found = new Set(rows.map(r => r["路燈編號"]));
+  const found = new Set(rows.flatMap(r => [r["路燈編號"], r["燈具編號"]]));
   const not_found = ids.filter(id => !found.has(id));
 
   res.json({ count: rows.length, results: rows, not_found });
