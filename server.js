@@ -297,13 +297,13 @@ function getLampBasic(id, districts) {
   if (!dbFull) return null;
   if (districts && districts.length) {
     const ph = districts.map(() => "?").join(",");
-    return dbFull.prepare(
+    return overlayFix([dbFull.prepare(
       `SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ? AND "行政區" IN (${ph})`
-    ).get(id, ...districts);
+    ).get(id, ...districts)])[0];
   }
-  return dbFull.prepare(
+  return overlayFix([dbFull.prepare(
     'SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" = ?'
-  ).get(id);
+  ).get(id)])[0];
 }
 
 // 桃園/楊梅/蘆竹 vs 新北 部分行政區編號會重複（例如開關箱編號），
@@ -380,6 +380,7 @@ app.get("/nearest", (req, res) => {
 
   if (!dbFull) return res.status(503).json({ error: "資料庫尚未就緒，請稍後再試" });
   const lamps = dbFull.prepare('SELECT "路燈編號" AS id, "緯度" AS lat, "經度" AS lng FROM lamps_full').all();
+  overlayFix(lamps);
 
   let nearest = null;
   let minDist = Infinity;
@@ -445,7 +446,7 @@ app.get("/tasks/:area", (req, res) => {
   } else if (lampIds.length && dbFull) {
     // 非自訂點：批次向合併庫（lamps_full，退回舊 lamps）查座標/地址/瓦數/色溫，程式端 join
     const ph = lampIds.map(() => "?").join(",");
-    const list = dbFull.prepare(`SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" IN (${ph})`).all(...lampIds);
+    const list = overlayFix(dbFull.prepare(`SELECT "路燈編號" AS id, "詳細位置" AS address, "緯度" AS lat, "經度" AS lng, "瓦特數" AS watt, "色溫" AS col FROM lamps_full WHERE "路燈編號" IN (${ph})`).all(...lampIds));
     for (const r of list) lampMap[r.id] = r;
   }
 
@@ -967,7 +968,7 @@ app.get("/lamp-full/:id", (req, res) => {
   const row = dbFull.prepare('SELECT * FROM lamps_full WHERE "路燈編號" = ?').get(id);
   if (!row) return res.status(404).json({ error: "查無此路燈編號" });
 
-  res.json(row);
+  res.json(overlayFix([row], "路燈編號", "緯度", "經度")[0]);
 });
 
 // ------------------------------------------------------
@@ -1049,6 +1050,7 @@ app.post("/lamps-full/batch", (req, res) => {
     `SELECT * FROM lamps_full WHERE "路燈編號" IN (${placeholders}) OR "燈具編號" IN (${placeholders})`
   ).all(...ids, ...ids);
 
+  overlayFix(rows, "路燈編號", "緯度", "經度");
   const found = new Set(rows.flatMap(r => [r["路燈編號"], r["燈具編號"]]));
   const not_found = ids.filter(id => !found.has(id));
 
@@ -1210,6 +1212,32 @@ db.prepare(`
     client_ip   TEXT
   )
 `).run();
+
+// 查詢時套用校正座標：有校正的燈，經緯度改回傳校正值（清冊原值不動，重新匯入清冊也不會洗掉校正）
+let fixAllStmt = null;
+function overlayFix(rows, idKey = "id", latKey = "lat", lngKey = "lng") {
+  const list = rows.filter(Boolean);
+  if (!list.length) return rows;
+  let fixes;
+  if (list.length > 2000) {
+    fixAllStmt = fixAllStmt || db.prepare("SELECT lamp_id, lat, lng FROM lamp_coord_fix");
+    fixes = fixAllStmt.all();
+  } else {
+    const ids = [...new Set(list.map(r => r[idKey]))];
+    fixes = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      fixes.push(...db.prepare(`SELECT lamp_id, lat, lng FROM lamp_coord_fix WHERE lamp_id IN (${chunk.map(() => "?").join(",")})`).all(...chunk));
+    }
+  }
+  if (!fixes.length) return rows;
+  const m = new Map(fixes.map(f => [f.lamp_id, f]));
+  for (const r of list) {
+    const f = m.get(r[idKey]);
+    if (f) { r[latKey] = f.lat; r[lngKey] = f.lng; }
+  }
+  return rows;
+}
 
 function checkAdminToken(req, res) {
   if (!process.env.ADMIN_TOKEN) {
