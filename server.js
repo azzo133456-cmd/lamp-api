@@ -1265,6 +1265,49 @@ app.get("/coord-fix", (req, res) => {
   res.json({ count: rows.length, results: withOriginalCoords(rows) });
 });
 
+// 範圍內路燈：?s=&w=&n=&e=（南西北東，度）。有校正座標的以校正為準並標 fixed=1
+// 給迴路圖工具「兩盞之間有哪些燈」用，篩選在前端做
+app.get("/lamps-full/bbox", (req, res) => {
+  if (!dbFull) return res.status(503).json({ error: "完整資料庫尚未就緒，請稍後再試" });
+  const s = Number(req.query.s), w = Number(req.query.w), n = Number(req.query.n), e = Number(req.query.e);
+  if (![s, w, n, e].every(isFinite) || s >= n || w >= e) return res.status(400).json({ error: "請提供 s,w,n,e" });
+  if (n - s > 0.05 || e - w > 0.05) return res.status(400).json({ error: "範圍太大（上限約 5 公里）" });
+
+  // 台帳座標誤差大，也要把「校正後落在範圍內」的燈找回來
+  const fixes = db.prepare(`
+    SELECT lamp_id, lat, lng FROM lamp_coord_fix
+    WHERE CAST(lat AS REAL) BETWEEN ? AND ? AND CAST(lng AS REAL) BETWEEN ? AND ?
+  `).all(s, n, w, e);
+  const rows = dbFull.prepare(`
+    SELECT "路燈編號" AS id, "緯度" AS lat, "經度" AS lng, "詳細位置" AS address, "是否廢止" AS abolished
+    FROM lamps_full
+    WHERE CAST("緯度" AS REAL) BETWEEN ? AND ? AND CAST("經度" AS REAL) BETWEEN ? AND ?
+    LIMIT 3000
+  `).all(s, n, w, e);
+
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const missingIds = fixes.map(f => f.lamp_id).filter(id => !byId.has(id));
+  for (let i = 0; i < missingIds.length; i += 500) {
+    const chunk = missingIds.slice(i, i + 500);
+    for (const r of dbFull.prepare(
+      `SELECT "路燈編號" AS id, "緯度" AS lat, "經度" AS lng, "詳細位置" AS address, "是否廢止" AS abolished FROM lamps_full WHERE "路燈編號" IN (${chunk.map(() => "?").join(",")})`
+    ).all(...chunk)) byId.set(r.id, r);
+  }
+  // 範圍內的燈若有校正座標（可能校正到範圍外），也一併套用
+  const allIds = [...byId.keys()];
+  const fixMap = new Map(fixes.map(f => [f.lamp_id, f]));
+  for (let i = 0; i < allIds.length; i += 500) {
+    const chunk = allIds.slice(i, i + 500).filter(id => !fixMap.has(id));
+    if (!chunk.length) continue;
+    for (const f of db.prepare(`SELECT lamp_id, lat, lng FROM lamp_coord_fix WHERE lamp_id IN (${chunk.map(() => "?").join(",")})`).all(...chunk)) fixMap.set(f.lamp_id, f);
+  }
+  const results = [...byId.values()].map(r => {
+    const f = fixMap.get(r.id);
+    return f ? { ...r, lat: f.lat, lng: f.lng, orig_lat: r.lat, orig_lng: r.lng, fixed: 1 } : { ...r, fixed: 0 };
+  });
+  res.json({ count: results.length, truncated: rows.length >= 3000, results });
+});
+
 // 寫入（UPSERT）：body { items: [ { id, lat, lng, box, circuit }, ... ] }
 app.post("/coord-fix", (req, res) => {
   if (!checkAdminToken(req, res)) return;
