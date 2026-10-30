@@ -1194,6 +1194,110 @@ app.post("/switchboxes/import", (req, res) => {
 });
 
 // ------------------------------------------------------
+// 📍 燈桿校正座標（lamp_coord_fix，存在 lamps.db / Railway Volume）
+// 開關箱迴路圖工具在地圖上點出的精確位置。台帳座標多只到小數 3 位（約 100m），
+// 這裡另存一份，不改 lamps_full（重新匯入台帳時才不會被洗掉）。
+// 寫入需 X-Admin-Token；讀取公開。
+// ------------------------------------------------------
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS lamp_coord_fix (
+    lamp_id     TEXT PRIMARY KEY,
+    lat         TEXT NOT NULL,
+    lng         TEXT NOT NULL,
+    box_id      TEXT,
+    circuit     TEXT,
+    updated_at  TEXT,
+    client_ip   TEXT
+  )
+`).run();
+
+function checkAdminToken(req, res) {
+  if (!process.env.ADMIN_TOKEN) {
+    res.status(503).json({ error: "伺服器未設定 ADMIN_TOKEN，無法寫入" });
+    return false;
+  }
+  if (req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+    res.status(401).json({ error: "未授權（X-Admin-Token 不正確）" });
+    return false;
+  }
+  return true;
+}
+
+// 附上台帳原座標，方便明細對照
+function withOriginalCoords(rows) {
+  if (!dbFull || rows.length === 0) return rows;
+  const ids = rows.map(r => r.lamp_id);
+  const orig = new Map();
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const ph = chunk.map(() => "?").join(",");
+    for (const o of dbFull.prepare(
+      `SELECT "路燈編號" AS id, "經度" AS lng, "緯度" AS lat, "詳細位置" AS address FROM lamps_full WHERE "路燈編號" IN (${ph})`
+    ).all(...chunk)) orig.set(o.id, o);
+  }
+  return rows.map(r => {
+    const o = orig.get(r.lamp_id);
+    return { ...r, orig_lat: o?.lat ?? "", orig_lng: o?.lng ?? "", address: o?.address ?? "" };
+  });
+}
+
+// 查詢：?near=lat,lng&r=公尺（附近）｜?since=YYYY-MM-DD（明細）｜?box=開關箱｜都不帶=全部
+app.get("/coord-fix", (req, res) => {
+  const { near, r, since, box } = req.query;
+  let rows;
+  if (near) {
+    const [lat, lng] = String(near).split(",").map(Number);
+    if (!isFinite(lat) || !isFinite(lng)) return res.status(400).json({ error: "near 格式應為 lat,lng" });
+    const radius = Math.min(Number(r) || 600, 3000);
+    const dLat = radius / 111000;
+    const dLng = radius / (111000 * Math.cos(lat * Math.PI / 180));
+    rows = db.prepare(`
+      SELECT * FROM lamp_coord_fix
+      WHERE CAST(lat AS REAL) BETWEEN ? AND ? AND CAST(lng AS REAL) BETWEEN ? AND ?
+    `).all(lat - dLat, lat + dLat, lng - dLng, lng + dLng);
+  } else if (since) {
+    rows = db.prepare("SELECT * FROM lamp_coord_fix WHERE updated_at >= ? ORDER BY updated_at, lamp_id").all(String(since));
+  } else if (box) {
+    rows = db.prepare("SELECT * FROM lamp_coord_fix WHERE box_id = ? ORDER BY lamp_id").all(String(box));
+  } else {
+    rows = db.prepare("SELECT * FROM lamp_coord_fix ORDER BY updated_at, lamp_id").all();
+  }
+  res.json({ count: rows.length, results: withOriginalCoords(rows) });
+});
+
+// 寫入（UPSERT）：body { items: [ { id, lat, lng, box, circuit }, ... ] }
+app.post("/coord-fix", (req, res) => {
+  if (!checkAdminToken(req, res)) return;
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (items.length === 0) return res.status(400).json({ error: "請提供 items 陣列" });
+  if (items.length > 2000) return res.status(400).json({ error: "一次最多 2000 筆" });
+
+  const bad = [];
+  const clean = [];
+  for (const it of items) {
+    const id = String(it?.id ?? "").trim();
+    const lat = Number(it?.lat), lng = Number(it?.lng);
+    // 只收台灣範圍內的座標，避免點錯或單位錯（經緯度對調）寫進去
+    if (!id || !(lat > 21 && lat < 26.5) || !(lng > 118 && lng < 122.5)) { bad.push(id || "(空編號)"); continue; }
+    clean.push({ id, lat: lat.toFixed(7), lng: lng.toFixed(7), box: String(it.box ?? ""), circuit: String(it.circuit ?? "") });
+  }
+  if (bad.length) return res.status(400).json({ error: "編號或座標不正確", bad });
+
+  const { date, time } = taiwanDateTime();
+  const now = `${date} ${time}`;
+  const upsert = db.prepare(`
+    INSERT INTO lamp_coord_fix (lamp_id, lat, lng, box_id, circuit, updated_at, client_ip)
+    VALUES (@id, @lat, @lng, @box, @circuit, @now, @ip)
+    ON CONFLICT(lamp_id) DO UPDATE SET
+      lat = excluded.lat, lng = excluded.lng, box_id = excluded.box_id,
+      circuit = excluded.circuit, updated_at = excluded.updated_at, client_ip = excluded.client_ip
+  `);
+  db.transaction(list => { for (const c of list) upsert.run({ ...c, now, ip: req.ip }); })(clean);
+  console.log(`[coord-fix] 寫入 ${clean.length} 筆`);
+  res.json({ ok: true, saved: clean.length, updated_at: now });
+});
+
+// ------------------------------------------------------
 // 📡 智控器訊號查詢（controllers：controller_id / IMEI / IMSI）
 // 支援用「ID」或「controller_id」查詢，批次比對
 // POST body: { ids: [...] }
